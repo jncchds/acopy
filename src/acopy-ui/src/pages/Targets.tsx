@@ -38,6 +38,9 @@ export default function Targets() {
                       ? <span className="chip chip-patina" title="Dump runs inside the container">exec · {t.containerName}</span>
                       : <span className="chip" title="Dump runs in ACopy over the network">{t.engine === 'Sqlite' ? t.databaseName : `${t.host}${t.port ? ':' + t.port : ''}`}</span>}
                     <span className="chip">{t.naming === 'Rolling' ? `rolling × ${t.keep}` : `keep ${t.keep}`}</span>
+                    {t.maxAgeDays && <span className="chip">≤ {t.maxAgeDays} days</span>}
+                    {t.encryptionKeyName && <span className="chip chip-accent" title="Encrypted">🔐 {t.encryptionKeyName}</span>}
+                    {t.destinationIds.length > 0 && <span className="chip" title="Copied to destinations">☁ × {t.destinationIds.length}</span>}
                     {t.source === 'DockerLabel' && <span className="chip chip-patina">🏷 labels</span>}
                   </div>
                   <div className="meta-line">

@@ -8,6 +8,8 @@ import TargetEdit from './pages/TargetEdit'
 import Activity from './pages/Activity'
 import Docker from './pages/Docker'
 import Settings from './pages/Settings'
+import Keys from './pages/Keys'
+import Destinations from './pages/Destinations'
 import { AuthProvider, useAuth } from './hooks/useAuth'
 import { TargetsProvider } from './hooks/useTargets'
 
@@ -24,6 +26,8 @@ function Gate() {
           <Route path="/targets/new" element={<TargetEdit />} />
           <Route path="/activity" element={<Activity />} />
           <Route path="/docker" element={<Docker />} />
+          <Route path="/destinations" element={<Destinations />} />
+          <Route path="/keys" element={<Keys />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
         <Route path="/targets/:id" element={<TargetLayout />}>

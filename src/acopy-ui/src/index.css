@@ -396,3 +396,16 @@ h3.section-title { font-size: 0.78rem; font-weight: 700; text-transform: upperca
   .entity-card { flex-direction: column; }
   .entity-card-right { align-items: flex-start; }
 }
+
+/* ── Upload markers (per destination, on a run) ── */
+.upload-badges { display: inline-flex; gap: 0.2rem; margin-left: 0.4rem; vertical-align: middle; }
+.upload-badge { font-size: 0.68rem; width: 1.15rem; height: 1.15rem; border-radius: 50%; display: inline-flex;
+                align-items: center; justify-content: center; border: 1px solid var(--border); }
+.ub-succeeded { background: rgb(34 197 94 / 0.15); border-color: rgb(34 197 94 / 0.4); }
+.ub-failed    { background: rgb(239 68 68 / 0.15); border-color: rgb(239 68 68 / 0.5); }
+.ub-pending   { background: rgb(var(--accent-rgb) / 0.15); border-color: var(--accent); }
+.ub-deleted   { opacity: 0.45; }
+
+/* ── Restore panel ── */
+.restore-card { border-color: var(--warning); }
+.restore-card h2 { color: var(--warning); }

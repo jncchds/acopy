@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   api, ApiError, apiError, describeCron, ENGINE_ICON,
-  type Compression, type Container, type Engine, type EngineInfo, type Meta, type Mode, type Naming, type Target, type TargetInput, type TestResult,
+  type Compression, type Container, type Destination, type EncKey, type Engine, type EngineInfo, type Meta, type Mode, type Naming, type Target, type TargetInput, type TestResult,
 } from '../api'
 import ToggleField from '../components/ToggleField'
 import { useTargets } from '../hooks/useTargets'
@@ -19,6 +19,7 @@ const EMPTY: TargetInput = {
   name: '', engine: 'PostgreSql', mode: 'DockerExec', host: '', port: null, containerName: '', username: '', password: '',
   passwordEnv: '', databaseName: '', extraArgs: '', customExtension: '', schedule: '0 3 * * *', enabled: true, keep: 7,
   naming: 'Timestamp', compression: 'Gzip', folder: '', timeoutMinutes: 120,
+  maxAgeDays: null, encryptionKeyId: null, destinationIds: [], restoreCommand: '',
 }
 
 function fromTarget(t: Target): TargetInput {
@@ -27,6 +28,7 @@ function fromTarget(t: Target): TargetInput {
     username: t.username ?? '', password: '', passwordEnv: t.passwordEnv ?? '', databaseName: t.databaseName ?? '',
     extraArgs: t.extraArgs ?? '', customExtension: t.customExtension ?? '', schedule: t.schedule, enabled: t.enabled,
     keep: t.keep, naming: t.naming, compression: t.compression, folder: t.folder, timeoutMinutes: t.timeoutMinutes,
+    maxAgeDays: t.maxAgeDays, encryptionKeyId: t.encryptionKeyId, destinationIds: t.destinationIds, restoreCommand: t.restoreCommand ?? '',
   }
 }
 
@@ -52,8 +54,14 @@ export default function TargetEdit() {
   const [dockerError, setDockerError] = useState('')
   const [hint, setHint] = useState('')
   const [deleteFiles, setDeleteFiles] = useState(false)
+  const [keys, setKeys] = useState<EncKey[]>([])
+  const [dests, setDests] = useState<Destination[]>([])
 
-  useEffect(() => { api.meta().then(setMeta).catch(e => setError(apiError(e))) }, [])
+  useEffect(() => {
+    api.meta().then(setMeta).catch(e => setError(apiError(e)))
+    api.keys().then(setKeys).catch(() => {})
+    api.destinations().then(setDests).catch(() => {})
+  }, [])
   useEffect(() => {
     api.containers().then(setContainers).catch(e => setDockerError(apiError(e)))
   }, [])
@@ -100,6 +108,7 @@ export default function TargetEdit() {
     ...f,
     port: f.port ? Number(f.port) : null,
     keep: Number(f.keep),
+    maxAgeDays: f.naming === 'Timestamp' && f.maxAgeDays ? Number(f.maxAgeDays) : null,
     timeoutMinutes: f.timeoutMinutes ? Number(f.timeoutMinutes) : 120,
     password: f.password || null,
   })
@@ -134,8 +143,9 @@ export default function TargetEdit() {
 
   const ext = useMemo(() => {
     const base = f.engine === 'Custom' && f.customExtension ? f.customExtension.replace(/^\./, '') : info?.extension ?? 'bin'
-    return base + (f.compression === 'Gzip' ? '.gz' : f.compression === 'Brotli' ? '.br' : '')
-  }, [f.engine, f.customExtension, f.compression, info])
+    const key = keys.find(k => k.id === f.encryptionKeyId)
+    return base + (f.compression === 'Gzip' ? '.gz' : f.compression === 'Brotli' ? '.br' : '') + (key ? (key.kind === 'Age' ? '.age' : '.enc') : '')
+  }, [f.engine, f.customExtension, f.compression, f.encryptionKeyId, keys, info])
   const base = slug(f.name || 'name')
   const folder = f.folder ? f.folder : slug(f.name || 'name')
   const examples = f.naming === 'Rolling'
@@ -156,8 +166,14 @@ export default function TargetEdit() {
     if (f.username) l.push(`${p}.user: "${f.username}"`)
     if (f.passwordEnv) l.push(`${p}.password_env: "${f.passwordEnv}"`)
     if (f.extraArgs) l.push(`${p}.args: "${f.extraArgs.replace(/"/g, '\\"')}"`)
+    if (f.maxAgeDays && f.naming === 'Timestamp') l.push(`${p}.max_age_days: "${f.maxAgeDays}"`)
+    const key = keys.find(k => k.id === f.encryptionKeyId)
+    if (key) l.push(`${p}.encryption: "${key.name}"`)
+    const names = dests.filter(d => f.destinationIds?.includes(d.id)).map(d => d.name)
+    if (names.length) l.push(`${p}.destinations: "${names.join(',')}"`)
+    if (f.engine === 'Custom' && f.restoreCommand) l.push(`${p}.restore_command: "${f.restoreCommand.replace(/"/g, '\\"')}"`)
     return l.map(x => `      ${x}`).join('\n')
-  }, [f, meta])
+  }, [f, meta, keys, dests])
 
   if (!meta || (!isNew && !targets)) return <p className="loading">Loading…</p>
   if (!isNew && !existing) return <p className="empty">This database no longer exists.</p>
@@ -286,6 +302,13 @@ export default function TargetEdit() {
             {f.engine === 'Custom' && (
               <label>File extension<input value={f.customExtension ?? ''} onChange={e => set('customExtension', e.target.value)} placeholder="json" />{err('customExtension')}</label>
             )}
+            {f.engine === 'Custom' && (
+              <label className="span-2">
+                Restore command (optional — receives the backup on stdin)
+                <textarea className="mono" value={f.restoreCommand ?? ''} onChange={e => set('restoreCommand', e.target.value)}
+                          placeholder={'curl -fsS -X POST -H "Content-Type: application/json" --data-binary @- http://couchdb:5984/mydb/_bulk_docs'} />
+              </label>
+            )}
           </div>
           {!readOnly && (
             <div className="form-actions">
@@ -327,14 +350,27 @@ export default function TargetEdit() {
             </label>
             <label>
               {f.naming === 'Rolling' ? 'Slots' : 'Copies to keep'}
-              <input type="number" min={1} max={1000} value={f.keep} onChange={e => set('keep', Number(e.target.value))} />
+              <input type="number" min={f.naming === 'Rolling' ? 1 : 0} max={1000} value={f.keep} onChange={e => set('keep', Number(e.target.value))} />
+              {f.naming === 'Timestamp' && <span className="hint">0 = unlimited (needs a maximum age)</span>}
               {err('keep')}
             </label>
+            {f.naming === 'Timestamp' && (
+              <label>
+                Maximum age (days)
+                <input type="number" min={1} value={f.maxAgeDays ?? ''} placeholder="no limit"
+                       onChange={e => set('maxAgeDays', e.target.value ? Number(e.target.value) : null)} />
+                <span className="hint">The newest copy is always kept, however old.</span>
+                {err('maxAgeDays')}
+              </label>
+            )}
           </div>
           <p className="callout-info" style={{ marginBottom: '0.9rem' }}>
             {f.naming === 'Rolling'
               ? <>Writes slot 0 → 1 → … → {Math.max(0, Number(f.keep) - 1)} → 0, overwriting in place — a fixed set of file names, ideal for Syncthing & co.</>
-              : <>A new file per run; the oldest are deleted once there are more than {f.keep}.</>}
+              : <>A new file per run; {[
+                  Number(f.keep) > 0 && `the oldest are deleted once there are more than ${f.keep}`,
+                  f.maxAgeDays && `copies older than ${f.maxAgeDays} days are deleted`,
+                ].filter(Boolean).join(', and ') || 'nothing is deleted'}.</>}
             <br />
             <span className="mono">/backups/{folder}/{examples.join(', ')}{f.naming === 'Rolling' && Number(f.keep) > 4 ? ', …' : ''}</span>
           </p>
@@ -359,6 +395,40 @@ export default function TargetEdit() {
             </label>
           </div>
           <ToggleField checked={f.enabled} onChange={v => set('enabled', v)} label="Scheduled" hint="Off = only manual backups" />
+        </div>
+
+        <div className="card">
+          <h2>Protection &amp; off-site copies</h2>
+          <label>
+            Encryption
+            <select value={f.encryptionKeyId ?? ''} onChange={e => set('encryptionKeyId', e.target.value ? Number(e.target.value) : null)}>
+              <option value="">None — store plain (compressed) files</option>
+              {keys.map(k => <option key={k.id} value={k.id}>🔐 {k.name} ({k.kind === 'Age' ? 'age public key' : 'passphrase'})</option>)}
+            </select>
+            <span className="hint">
+              {keys.length === 0 ? <>No keys yet — <a style={{ cursor: 'pointer' }} onClick={() => nav('/keys')}>create one</a>.</> : 'Applies to new backups; older files keep the key they were written with.'}
+            </span>
+            {err('encryptionKeyId')}
+          </label>
+          <label>
+            Copy each backup to
+            {dests.length === 0 ? (
+              <span className="hint">No destinations yet — <a style={{ cursor: 'pointer' }} onClick={() => nav('/destinations')}>add S3, SFTP, Telegram, …</a></span>
+            ) : (
+              <div className="segmented">
+                {dests.map(d => {
+                  const on = f.destinationIds?.includes(d.id) ?? false
+                  return (
+                    <button key={d.id} type="button" className={on ? 'active' : ''}
+                            onClick={() => set('destinationIds', on ? (f.destinationIds ?? []).filter(x => x !== d.id) : [...(f.destinationIds ?? []), d.id])}>
+                      {d.kind === 'Telegram' ? '✈' : '☁'} {d.name}{!d.enabled ? ' (disabled)' : ''}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            {err('destinationIds')}
+          </label>
         </div>
       </fieldset>
 

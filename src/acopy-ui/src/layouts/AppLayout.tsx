@@ -16,6 +16,8 @@ export default function AppLayout() {
         <SidebarLink to="/" icon="◈" label="Dashboard" />
         <SidebarLink to="/targets" icon="🗃" label="Databases" />
         <SidebarLink to="/activity" icon="📜" label="Activity" />
+        <SidebarLink to="/destinations" icon="☁" label="Destinations" />
+        <SidebarLink to="/keys" icon="🔐" label="Encryption keys" />
         <SidebarLink to="/docker" icon="🐳" label="Docker" />
         <SidebarLink to="/settings" icon="⚙" label="Settings" />
         <SidebarDivider />

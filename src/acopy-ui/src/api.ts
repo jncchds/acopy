@@ -6,12 +6,27 @@ export type Naming = 'Timestamp' | 'Rolling'
 export type Compression = 'None' | 'Gzip' | 'Brotli'
 export type RunStatus = 'Queued' | 'Running' | 'Succeeded' | 'Failed' | 'Cancelled'
 
+export interface Upload {
+  id: number
+  destinationId: number
+  destinationName: string | null
+  kind: 'Rclone' | 'Telegram' | ''
+  status: 'Pending' | 'Succeeded' | 'Failed'
+  remoteRef: string | null
+  error: string | null
+  finishedAt: string | null
+  deleted: boolean
+  canRestore: boolean
+}
+
 export interface Run {
   id: number
   targetId: number
   targetName: string | null
+  kind: 'Backup' | 'Restore'
   status: RunStatus
-  trigger: 'Schedule' | 'Manual'
+  trigger: 'Schedule' | 'Manual' | 'SafetyBackup'
+  sourceRunId: number | null
   startedAt: string
   finishedAt: string | null
   filePath: string | null
@@ -19,8 +34,10 @@ export interface Run {
   sha256: string | null
   slot: number | null
   fileGone: boolean
+  encryptionKeyId: number | null
   error: string | null
   log: string | null
+  uploads: Upload[]
 }
 
 export interface Target {
@@ -40,10 +57,16 @@ export interface Target {
   schedule: string
   enabled: boolean
   keep: number
+  maxAgeDays: number | null
   naming: Naming
   compression: Compression
   folder: string
   timeoutMinutes: number
+  encryptionKeyId: number | null
+  encryptionKeyName: string | null
+  destinationIds: number[]
+  restoreCommand: string | null
+  restoreUnsupported: string | null
   source: 'Manual' | 'DockerLabel'
   orphaned: boolean
   createdAt: string
@@ -73,11 +96,76 @@ export interface TargetInput {
   schedule: string
   enabled: boolean
   keep: number
+  maxAgeDays?: number | null
   naming: Naming
   compression: Compression
   folder?: string | null
   timeoutMinutes?: number | null
+  encryptionKeyId?: number | null
+  destinationIds?: number[]
+  restoreCommand?: string | null
 }
+
+export type KeyKind = 'Passphrase' | 'Age'
+export interface EncKey {
+  id: number
+  name: string
+  kind: KeyKind
+  hasSecret: boolean
+  recipients: string[]
+  usedBy: number
+  createdAt: string
+  decryptHint: string
+}
+export interface KeyInput {
+  name: string
+  kind: KeyKind
+  passphrase?: string
+  generate?: boolean
+  recipients?: string
+  identity?: string
+}
+
+export interface BackendField {
+  key: string
+  label: string
+  secret: boolean
+  obscure: boolean
+  required: boolean
+  placeholder: string | null
+  options: string[] | null
+  hint: string | null
+}
+export interface Backend { type: string; label: string; pathHint: string; fields: BackendField[] }
+
+export type DestinationKind = 'Rclone' | 'Telegram'
+export interface Destination {
+  id: number
+  name: string
+  kind: DestinationKind
+  enabled: boolean
+  rcloneType: string | null
+  params: Record<string, string>
+  secretKeys: string[]
+  remotePath: string | null
+  keep: number | null
+  maxAgeDays: number | null
+  usedBy: number
+  createdAt: string
+}
+export interface DestinationInput {
+  name: string
+  kind: DestinationKind
+  enabled: boolean
+  rcloneType?: string | null
+  params: Record<string, string>
+  secrets: Record<string, string>
+  clearSecrets?: string[]
+  remotePath?: string | null
+  keep?: number | null
+  maxAgeDays?: number | null
+}
+export interface RestoreInput { safetyBackup: boolean; confirmName: string; ageIdentity?: string | null; fromUploadId?: number | null }
 
 export interface EngineInfo {
   engine: Engine
@@ -150,7 +238,25 @@ export interface Detected {
 }
 
 export interface TestResult { ok: boolean; message: string; details: string | null }
-export interface Settings { timeZone: string; webhookUrl: string | null; notifyOnSuccess: boolean }
+export interface Settings {
+  timeZone: string
+  webhookUrl: string | null
+  notifyOnSuccess: boolean
+  telegramHasToken: boolean
+  telegramChatId: string | null
+  telegramThreadId: string | null
+  telegramApiUrl: string | null
+}
+export interface SettingsInput {
+  timeZone: string
+  webhookUrl: string | null
+  notifyOnSuccess: boolean
+  telegramToken?: string | null
+  clearTelegramToken?: boolean
+  telegramChatId?: string | null
+  telegramThreadId?: string | null
+  telegramApiUrl?: string | null
+}
 export interface AuthState { disabled: boolean; setupRequired: boolean; authenticated: boolean; passwordFromEnv: boolean }
 
 // ── Transport ─────────────────────────────────────────────────────────────────
@@ -234,8 +340,35 @@ export const api = {
   scan: () => request<unknown>('POST', '/api/docker/scan'),
 
   settings: () => request<Settings>('GET', '/api/settings'),
-  saveSettings: (s: Settings) => request<Settings>('PUT', '/api/settings', s),
+  saveSettings: (s: SettingsInput) => request<Settings>('PUT', '/api/settings', s),
   testWebhook: () => request<void>('POST', '/api/settings/test-webhook'),
+  testTelegram: () => request<void>('POST', '/api/settings/test-telegram'),
+
+  keys: () => request<EncKey[]>('GET', '/api/keys'),
+  createKey: (k: KeyInput) => request<EncKey>('POST', '/api/keys', k),
+  deleteKey: (id: number) => request<void>('DELETE', `/api/keys/${id}`),
+  exportKey: async (id: number, password: string) => {
+    const res = await fetch(`/api/keys/${id}/export`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }), credentials: 'same-origin',
+    })
+    if (!res.ok) {
+      let msg = `${res.status}`
+      try { const p = await res.json(); msg = p.detail ?? p.title ?? msg } catch { /* not JSON */ }
+      throw new ApiError(res.status, msg)
+    }
+    return res.text()
+  },
+
+  backends: () => request<Backend[]>('GET', '/api/destinations/backends'),
+  destinations: () => request<Destination[]>('GET', '/api/destinations'),
+  createDestination: (d: DestinationInput) => request<Destination>('POST', '/api/destinations', d),
+  updateDestination: (id: number, d: DestinationInput) => request<Destination>('PUT', `/api/destinations/${id}`, d),
+  deleteDestination: (id: number) => request<void>('DELETE', `/api/destinations/${id}`),
+  testDestination: (d: DestinationInput, id?: number) =>
+    request<{ ok: boolean; message: string }>('POST', `/api/destinations/test${id ? `?id=${id}` : ''}`, d),
+
+  restore: (runId: number, r: RestoreInput) => request<{ runId: number }>('POST', `/api/runs/${runId}/restore`, r),
+  retryUpload: (id: number) => request<Upload>('POST', `/api/uploads/${id}/retry`),
   timezones: () => request<string[]>('GET', '/api/timezones'),
 }
 

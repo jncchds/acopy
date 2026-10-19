@@ -115,7 +115,14 @@ export default function Docker() {
       ${p}.enable: "true"
       ${p}.schedule: "0 3 * * *"   # daily 03:00
       ${p}.keep: "7"
-      ${p}.naming: "rolling"       # postgres.0.sql.gz … postgres.6.sql.gz`}</div>
+      ${p}.naming: "rolling"       # postgres.0.sql.gz … postgres.6.sql.gz
+      ${p}.encryption: "offsite"   # a key from Encryption keys
+      ${p}.destinations: "s3,tg"   # destinations by name
+
+  # Several targets from one container:
+  #   ${p}.database: "app,analytics"          → postgres-app, postgres-analytics
+  #   ${p}.jobs.hourly.schedule: "0 * * * *"  → postgres-hourly (inherits the rest)
+  #   ${p}.jobs.hourly.naming: "rolling"`}</div>
         <div className="data-table">
           <table>
             <tbody>

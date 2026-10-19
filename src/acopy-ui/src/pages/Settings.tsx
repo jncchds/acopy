@@ -13,6 +13,8 @@ export default function Settings() {
   const { state } = useAuth()
   const [cur, setCur] = useState('')
   const [pw, setPw] = useState('')
+  const [tgToken, setTgToken] = useState('')
+  const [tgClear, setTgClear] = useState(false)
 
   useEffect(() => {
     api.settings().then(setS)
@@ -20,16 +22,32 @@ export default function Settings() {
     api.timezones().then(setZones)
   }, [])
 
-  const save = async () => {
+  const persist = async () => {
     if (!s) return
+    const saved = await api.saveSettings({
+      timeZone: s.timeZone, webhookUrl: s.webhookUrl, notifyOnSuccess: s.notifyOnSuccess,
+      telegramToken: tgToken || null, clearTelegramToken: tgClear,
+      telegramChatId: s.telegramChatId, telegramThreadId: s.telegramThreadId, telegramApiUrl: s.telegramApiUrl,
+    })
+    setS(saved)
+    setTgToken('')
+    setTgClear(false)
+  }
+
+  const save = async () => {
     setBusy(true)
-    try { setS(await api.saveSettings(s)); show('Settings saved') }
+    try { await persist(); show('Settings saved') }
     catch (e) { show(apiError(e), true) }
     finally { setBusy(false) }
   }
 
   const testHook = async () => {
-    try { await save(); await api.testWebhook(); show('Test notification sent') }
+    try { await persist(); await api.testWebhook(); show('Test notification sent') }
+    catch (e) { show(apiError(e), true) }
+  }
+
+  const testTelegram = async () => {
+    try { await persist(); await api.testTelegram(); show('Telegram message sent') }
     catch (e) { show(apiError(e), true) }
   }
 
@@ -65,6 +83,34 @@ export default function Settings() {
                      label="Also notify on success" hint="Failures are always sent" />
         <div className="form-actions" style={{ marginTop: '0.75rem' }}>
           <button className="btn-ghost" onClick={testHook} disabled={!s.webhookUrl}>Send test</button>
+        </div>
+
+        <h3 className="section-title">✈ Telegram</h3>
+        <div className="form-grid">
+          <label>
+            Bot token
+            <input type="password" autoComplete="new-password" value={tgToken} onChange={e => setTgToken(e.target.value)}
+                   placeholder={s.telegramHasToken && !tgClear ? '•••••• (unchanged)' : '123456:ABC… from @BotFather'} />
+            {s.telegramHasToken && (
+              <span className="hint"><a style={{ cursor: 'pointer' }} onClick={() => setTgClear(c => !c)}>{tgClear ? 'Keep the stored token' : 'Remove the stored token'}</a></span>
+            )}
+          </label>
+          <label>
+            Chat id
+            <input value={s.telegramChatId ?? ''} onChange={e => setS({ ...s, telegramChatId: e.target.value })} placeholder="-1001234567890 or your user id" />
+          </label>
+          <label>
+            Topic / thread id (optional)
+            <input value={s.telegramThreadId ?? ''} onChange={e => setS({ ...s, telegramThreadId: e.target.value })} />
+          </label>
+          <label>
+            Bot API URL (optional)
+            <input value={s.telegramApiUrl ?? ''} onChange={e => setS({ ...s, telegramApiUrl: e.target.value })} placeholder="https://api.telegram.org" />
+          </label>
+        </div>
+        <p className="hint">Same rules as the webhook: failures always, successes when the toggle above is on. To send the backup files themselves, add a Telegram <em>destination</em>.</p>
+        <div className="form-actions" style={{ marginTop: '0.75rem' }}>
+          <button className="btn-ghost" onClick={testTelegram} disabled={!(s.telegramHasToken || tgToken) || !s.telegramChatId}>Send test</button>
         </div>
       </div>
 
