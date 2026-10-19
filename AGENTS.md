@@ -14,7 +14,9 @@ containers. The user-facing description is [README.md](README.md) (it is also th
 - **Never delete a file ACopy did not write.** Retention only matches names this target produces
   (`BackupFiles.FilesToPrune` / `OwnedFiles`); keep it that way.
 - **Secrets never reach a command line or the browser.** Passwords go through env vars (`PGPASSWORD`,
-  `MYSQL_PWD`, `REDISCLI_AUTH`, `SQLCMDPASSWORD`) or a 0600 temp config file; DTOs expose `hasPassword` only.
+  `MYSQL_PWD`, `REDISCLI_AUTH`, `SQLCMDPASSWORD`), rclone `RCLONE_CONFIG_ACOPY_*` variables, or a 0600 temp
+  file; DTOs expose `hasPassword` / `secretKeys` only. Stored secrets use Data Protection (`Secrets`). The one
+  deliberate exception is exporting an age private key, which requires re-entering the admin password.
 - After every change keep green: `dotnet build ACopy.slnx`, `dotnet test ACopy.slnx`,
   `npx tsc -b --noEmit` (in `src/acopy-ui`). For engine/runner changes also run the e2e stack (below).
 - **Versioning:** `VERSION` holds the app version (shown in the UI pill, tagged on the image). Every
@@ -25,18 +27,21 @@ containers. The user-facing description is [README.md](README.md) (it is also th
 ```
 src/ACopy.Api/
   Data/        EF Core entities (BackupTarget, BackupRun, AppSetting), context, migrations
-  Engines/     EngineCatalog (per-engine facts, image detection, env credentials) and
-               DumpCommandBuilder (argv/env for network and docker-exec modes)
-  Docker/      DockerClient (raw Engine API over the unix socket: list, inspect, exec + demux),
-               LabelConfig (label parsing), LabelDiscovery (periodic sync into targets)
-  Services/    BackupRunner (execute, compress, atomic rename, retention, history),
+  Engines/     EngineCatalog (per-engine facts, image detection, env credentials),
+               DumpCommandBuilder and RestoreCommandBuilder (argv/env for network and docker-exec modes)
+  Destinations/ RcloneCatalog (backend forms), DestinationService (upload, remote retention, download, test),
+               TelegramClient (Bot API: messages, documents, deletion)
+  Docker/      DockerClient (raw Engine API over a unix socket or tcp/TLS: list, inspect, exec + demux,
+               archive upload), LabelConfig (labels, jobs, database lists), LabelDiscovery (sync into targets)
+  Services/    BackupRunner (backup: dump → compress → encrypt → atomic rename → retention → uploads;
+               restore: fetch → decrypt → decompress → load; history), Encryption (OpenSSL format, age),
                Scheduler (cron via Cronos), BackupFiles (naming/retention, pure),
                ConnectionTester, Notifier (webhook), SettingsStore (+ password hashing)
   Endpoints/   Minimal-API endpoint groups and DTOs
-src/ACopy.Tests/ xUnit tests (naming, retention, labels, command building, docker stream demux)
+src/ACopy.Tests/ xUnit tests (naming, retention, labels/jobs, dump + restore commands, encryption, demux)
 src/acopy-ui/    React 19 + TypeScript + Vite SPA — plain CSS, one global stylesheet
 docker/          entrypoint.sh (PUID/PGID drop, docker-socket group)
-scripts/e2e/     docker-compose.e2e.yml + e2e.mjs — real databases, end to end
+scripts/e2e/     docker-compose.e2e.yml + e2e.mjs (+ mock-telegram.mjs) — real databases, S3, restores
 ```
 
 ## Conventions
@@ -60,6 +65,8 @@ node scripts/e2e/e2e.mjs        # UI: http://localhost:5006, password e2e-passwo
 docker compose -f scripts/e2e/docker-compose.e2e.yml down -v
 ```
 
-The e2e script discovers the labelled containers, adds a network-mode SQLite target, tests each
-connection, backs everything up and prints status/size/errors (exit code 1 on any failure).
-SQL Server is not in the e2e stack (its image is amd64-only).
+The e2e script creates keys (passphrase + age) and destinations (an S3 server — `rclone serve s3` — and a
+mock Telegram Bot API), discovers the labelled containers (incl. jobs), adds a network-mode SQLite target,
+tests each connection, backs everything up, checks uploads and S3 retention, restores PostgreSQL (local
+file), MariaDB (age-encrypted, from the S3 copy) and SQLite, and checks the data came back (exit code 1 on
+any failure). SQL Server is not in the e2e stack (its image is amd64-only).

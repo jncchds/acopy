@@ -1,4 +1,5 @@
-# End-to-end stack: ACopy plus one container per engine, configured through labels.
+# End-to-end stack: ACopy plus one container per engine (configured through labels), an S3 server
+# destination and a mock Telegram Bot API.
 #   docker compose -f scripts/e2e/docker-compose.e2e.yml up -d --build
 #   node scripts/e2e/e2e.mjs
 # UI on http://localhost:5006 (password: e2e-password)
@@ -16,23 +17,31 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - acopy-data:/data
       - acopy-backups:/backups
-      - sqlite-data:/sqlite:ro
+      - sqlite-data:/sqlite
 
   postgres:
     image: postgres:17-alpine
     environment: { POSTGRES_PASSWORD: pg-secret, POSTGRES_DB: appdb }
     labels:
       acopy.enable: "true"
-      acopy.schedule: "*/2 * * * *"
-      acopy.keep: "3"
-      acopy.naming: "rolling"
+      # Two targets from one container: the app database (encrypted, copied off-site) and the whole cluster
+      acopy.jobs.app.database: "appdb"
+      acopy.jobs.app.encryption: "e2e-pass"
+      acopy.jobs.app.destinations: "s3,tg"
+      acopy.jobs.all.schedule: "*/2 * * * *"
+      acopy.jobs.all.keep: "3"
+      acopy.jobs.all.naming: "rolling"
 
   mariadb:
     image: mariadb:11
     environment: { MARIADB_ROOT_PASSWORD: maria-secret, MARIADB_DATABASE: shop }
     labels:
       acopy.enable: "true"
-      acopy.keep: "2"
+      acopy.database: "shop"
+      acopy.keep: "0"
+      acopy.max_age_days: "30"
+      acopy.encryption: "e2e-age"
+      acopy.destinations: "s3"
 
   mysql:
     image: mysql:8.4
@@ -60,8 +69,19 @@ services:
   # Creates a small SQLite file in a shared volume for the network-mode SQLite test
   sqlite-seed:
     image: alpine:3.22
-    command: sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /sqlite/app.db 'create table if not exists t(x); insert into t values (1),(2),(3);' && sleep infinity"
+    command: sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /sqlite/app.db 'create table if not exists t(x); delete from t; insert into t values (1),(2),(3);' && sleep infinity"
     volumes: ["sqlite-data:/sqlite"]
+
+  # S3 destination: rclone serving a directory over the S3 API
+  s3:
+    image: rclone/rclone:latest
+    command: serve s3 /data --auth-key e2ekey,e2esecret --addr :9000
+
+  mock-telegram:
+    image: node:22-alpine
+    command: node /mock/mock-telegram.mjs
+    ports: ["5081:8081"]
+    volumes: ["./mock-telegram.mjs:/mock/mock-telegram.mjs:ro"]
 
 volumes:
   acopy-data:

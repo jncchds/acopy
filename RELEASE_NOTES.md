@@ -1,5 +1,36 @@
 # Release notes
 
+## v0.2.0 — 2026-10-20
+
+### Restore
+- **One-click restore** of any successful backup, from the local file or — when it has rotated out locally —
+  from a copy on an rclone destination. Network mode uses the bundled clients; exec mode copies the dump
+  into the container and runs its own tools (psql, mariadb/mysql, mongorestore, sqlite3, sqlcmd).
+- A **safety backup** of the current state is taken first by default; confirm by typing the database name.
+- Custom targets get an optional *restore command* (reads the backup on stdin). Redis restores stay manual.
+- PostgreSQL dumps now include `--clean --if-exists` so they restore in place.
+
+### Encryption
+- **Encryption keys**, chosen per database or with `acopy.encryption=<key>`:
+  - **Passphrase** — AES-256 in OpenSSL's format (`.enc`), decryptable with `openssl enc -d`.
+  - **age** — public-key encryption (`.age`); generate a pair in ACopy (exportable private key) or store only
+    the public key and paste the private key when restoring.
+
+### Off-site copies
+- **Destinations**: any rclone backend (forms for S3/MinIO/R2/Wasabi, B2, SFTP, WebDAV/Nextcloud, SMB, FTP,
+  local path; raw options for the rest) and **Telegram** (files split into parts above the bot limit;
+  self-hosted Bot API servers supported).
+- Per-destination retention (mirror the local one, or keep N / N days), upload status per run, retry.
+
+### Retention, labels, Docker
+- **Maximum age** in days, alone or combined with keep-N; the newest copy is always kept.
+- **Several targets per container**: `acopy.database=a,b` and named jobs `acopy.jobs.<job>.<key>`.
+- New labels: `max_age_days`, `encryption`, `destinations`, `restore_command`.
+- **Docker over TCP** (`tcp://…`, e.g. a socket proxy) with optional TLS; `DOCKER_HOST` is honoured.
+
+### Notifications
+- **Telegram** notifications next to the webhook; upload failures are reported too.
+
 ## v0.1.0 — 2026-10-19
 
 First release. ACopy backs up the databases on a Docker host on a schedule and keeps the last N copies.
