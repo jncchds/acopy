@@ -28,7 +28,9 @@ public static class DumpCommandBuilder
 
     private static DumpCommand BuildNetwork(BackupTarget t, Credentials c, List<string> extra, string tempDir)
     {
-        var host = t.Host ?? throw new InvalidOperationException("Host is required in network mode");
+        var host = t.Host ?? "";
+        if (host.Length == 0 && t.Engine is not (Engine.Sqlite or Engine.Custom))
+            throw new InvalidOperationException("Host is required in network mode");
         var port = (t.Port ?? EngineCatalog.Get(t.Engine).DefaultPort ?? 0).ToString();
         var db = c.Database;
         switch (t.Engine)

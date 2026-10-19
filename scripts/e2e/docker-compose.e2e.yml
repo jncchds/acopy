@@ -1,0 +1,69 @@
+# End-to-end stack: ACopy plus one container per engine, configured through labels.
+#   docker compose -f scripts/e2e/docker-compose.e2e.yml up -d --build
+#   node scripts/e2e/e2e.mjs
+# UI on http://localhost:5006 (password: e2e-password)
+name: acopy-e2e
+
+services:
+  acopy:
+    build: { context: ../.., dockerfile: Dockerfile }
+    ports: ["5006:8080"]
+    environment:
+      ACOPY_Auth__Password: e2e-password
+      ACOPY_Docker__ScanSeconds: "10"
+      TZ: Europe/Berlin
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acopy-data:/data
+      - acopy-backups:/backups
+      - sqlite-data:/sqlite:ro
+
+  postgres:
+    image: postgres:17-alpine
+    environment: { POSTGRES_PASSWORD: pg-secret, POSTGRES_DB: appdb }
+    labels:
+      acopy.enable: "true"
+      acopy.schedule: "*/2 * * * *"
+      acopy.keep: "3"
+      acopy.naming: "rolling"
+
+  mariadb:
+    image: mariadb:11
+    environment: { MARIADB_ROOT_PASSWORD: maria-secret, MARIADB_DATABASE: shop }
+    labels:
+      acopy.enable: "true"
+      acopy.keep: "2"
+
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: mysql-secret, MYSQL_DATABASE: blog }
+    labels:
+      acopy.enable: "true"
+      acopy.name: "mysql-net"
+      acopy.mode: "network"
+      acopy.user: "root"
+      acopy.password: "mysql-secret"
+      acopy.database: "blog"
+
+  mongo:
+    image: mongo:8
+    environment: { MONGO_INITDB_ROOT_USERNAME: root, MONGO_INITDB_ROOT_PASSWORD: mongo-secret }
+    labels:
+      acopy.enable: "true"
+      acopy.compression: "none"
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    labels:
+      acopy.enable: "true"
+
+  # Creates a small SQLite file in a shared volume for the network-mode SQLite test
+  sqlite-seed:
+    image: alpine:3.22
+    command: sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /sqlite/app.db 'create table if not exists t(x); insert into t values (1),(2),(3);' && sleep infinity"
+    volumes: ["sqlite-data:/sqlite"]
+
+volumes:
+  acopy-data:
+  acopy-backups:
+  sqlite-data:

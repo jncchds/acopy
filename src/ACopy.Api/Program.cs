@@ -24,7 +24,9 @@ var authOptions = builder.Configuration.GetSection("Auth").Get<AuthOptions>() ??
 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(paths.Database))!);
 Directory.CreateDirectory(paths.Backups);
 
-builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlite($"Data Source={paths.Database};Pooling=False"));
+builder.Services.AddDbContext<AppDbContext>(o => o
+    .UseSqlite($"Data Source={paths.Database};Pooling=False")
+    .AddInterceptors(new BusyTimeoutInterceptor()));
 // Target passwords are encrypted with a key ring stored in the same SQLite file — one file to back up.
 builder.Services.AddDataProtection().SetApplicationName("ACopy").PersistKeysToDbContext<AppDbContext>();
 

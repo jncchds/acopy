@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+**/node_modules/
+src/ACopy.Api/wwwroot/
+src/acopy-ui/dist/
+.vs/
+*.user
+*.log
+.git/
+data/
+backups/
