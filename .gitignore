@@ -1,0 +1,20 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+*.swp
+
+# UI
+node_modules/
+dist/
+src/ACopy.Api/wwwroot/
+*.local
+
+# local data
+data/
+backups/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
