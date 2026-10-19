@@ -7,5 +7,5 @@ src/acopy-ui/dist/
 *.user
 *.log
 .git/
-data/
-backups/
+/data/
+/backups/
