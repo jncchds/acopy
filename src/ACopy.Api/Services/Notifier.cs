@@ -1,32 +1,76 @@
 using System.Net.Http.Json;
 using ACopy.Api.Data;
+using ACopy.Api.Destinations;
 
 namespace ACopy.Api.Services;
 
 /// <summary>
-/// Posts a JSON event to the configured webhook. The payload carries both <c>text</c> (Slack, Mattermost,
-/// ntfy-compatible relays) and <c>content</c> (Discord) so common chat webhooks work without an adapter.
+/// Sends run outcomes to the configured channels: a JSON webhook (payload carries both <c>text</c> — Slack,
+/// Mattermost — and <c>content</c> — Discord) and/or a Telegram chat.
 /// </summary>
-public class Notifier(SettingsStore settings, IHttpClientFactory httpFactory, ILogger<Notifier> log)
+public class Notifier(SettingsStore settings, Secrets secrets, TelegramClient telegram, IHttpClientFactory httpFactory, ILogger<Notifier> log)
 {
     public async Task NotifyAsync(BackupTarget target, BackupRun run)
     {
-        var url = await settings.GetAsync(SettingsStore.KeyWebhookUrl);
-        if (string.IsNullOrWhiteSpace(url)) return;
-        var ok = run.Status == RunStatus.Succeeded;
+        var failedUploads = run.Uploads.Where(u => u.Status == UploadStatus.Failed).ToList();
+        var ok = run.Status == RunStatus.Succeeded && failedUploads.Count == 0;
         if (ok && await settings.GetAsync(SettingsStore.KeyNotifyOnSuccess) != "true") return;
 
-        var text = ok
-            ? $"✅ ACopy: backup of {target.Name} succeeded ({FormatSize(run.SizeBytes)}) → {run.FilePath}"
-            : $"❌ ACopy: backup of {target.Name} {run.Status.ToString().ToLowerInvariant()}: {run.Error}";
-        await PostAsync(url, new
+        var what = run.Kind == RunKind.Restore ? "restore" : "backup";
+        string text, html;
+        if (run.Status == RunStatus.Succeeded && failedUploads.Count > 0)
         {
-            @event = ok ? "backup.succeeded" : "backup.failed",
+            var list = string.Join(", ", failedUploads.Select(u => $"{u.Destination?.Name ?? "#" + u.DestinationId}: {u.Error}"));
+            text = $"⚠️ ACopy: {what} of {target.Name} succeeded, but uploads failed — {list}";
+            html = $"⚠️ <b>{E(target.Name)}</b>: {what} succeeded, uploads failed\n{E(list)}";
+        }
+        else if (ok)
+        {
+            text = run.Kind == RunKind.Restore
+                ? $"✅ ACopy: {target.Name} restored from {run.FilePath}"
+                : $"✅ ACopy: backup of {target.Name} succeeded ({FormatSize(run.SizeBytes)}) → {run.FilePath}";
+            html = run.Kind == RunKind.Restore
+                ? $"✅ <b>{E(target.Name)}</b> restored from <code>{E(run.FilePath ?? "")}</code>"
+                : $"✅ <b>{E(target.Name)}</b> backed up · {FormatSize(run.SizeBytes)}\n<code>{E(run.FilePath ?? "")}</code>";
+        }
+        else
+        {
+            var status = run.Status.ToString().ToLowerInvariant();
+            text = $"❌ ACopy: {what} of {target.Name} {status}: {run.Error}";
+            html = $"❌ <b>{E(target.Name)}</b>: {what} {status}\n{E(run.Error ?? "")}";
+        }
+
+        var payload = new
+        {
+            @event = ok ? $"{what}.succeeded" : run.Status == RunStatus.Succeeded ? "upload.failed" : $"{what}.failed",
             text,
             content = text,
             target = new { target.Id, target.Name, engine = target.Engine.ToString() },
-            run = new { run.Id, status = run.Status.ToString(), run.StartedAt, run.FinishedAt, run.FilePath, run.SizeBytes, run.Sha256, run.Error },
-        });
+            run = new
+            {
+                run.Id, kind = run.Kind.ToString(), status = run.Status.ToString(), run.StartedAt, run.FinishedAt,
+                run.FilePath, run.SizeBytes, run.Sha256, run.Error,
+                uploads = run.Uploads.Select(u => new { destination = u.Destination?.Name, status = u.Status.ToString(), u.Error }),
+            },
+        };
+
+        var url = await settings.GetAsync(SettingsStore.KeyWebhookUrl);
+        if (!string.IsNullOrWhiteSpace(url)) await PostAsync(url, payload);
+        if (await TelegramTargetAsync() is { } tg)
+        {
+            try { await telegram.SendMessageAsync(tg, html, CancellationToken.None); }
+            catch (Exception e) { log.LogWarning(e, "Telegram notification failed"); }
+        }
+    }
+
+    public async Task<TelegramTarget?> TelegramTargetAsync()
+    {
+        var token = secrets.Unprotect(await settings.GetAsync(SettingsStore.KeyTelegramToken));
+        var chat = await settings.GetAsync(SettingsStore.KeyTelegramChat);
+        if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(chat)) return null;
+        int? thread = int.TryParse(await settings.GetAsync(SettingsStore.KeyTelegramThread), out var t) ? t : null;
+        var api = await settings.GetAsync(SettingsStore.KeyTelegramApi);
+        return new TelegramTarget(token, chat, thread, string.IsNullOrWhiteSpace(api) ? TelegramClient.DefaultApi : api);
     }
 
     public async Task<string?> SendTestAsync(string url)
@@ -36,6 +80,14 @@ public class Notifier(SettingsStore settings, IHttpClientFactory httpFactory, IL
             using var res = await Client().PostAsJsonAsync(url, new { @event = "test", text = "ACopy test notification", content = "ACopy test notification" });
             return res.IsSuccessStatusCode ? null : $"HTTP {(int)res.StatusCode}";
         }
+        catch (Exception e) { return e.Message; }
+    }
+
+    public async Task<string?> SendTelegramTestAsync()
+    {
+        var tg = await TelegramTargetAsync();
+        if (tg == null) return "Bot token and chat id are required";
+        try { await telegram.SendMessageAsync(tg, "✅ ACopy notifications work.", CancellationToken.None); return null; }
         catch (Exception e) { return e.Message; }
     }
 
@@ -55,6 +107,8 @@ public class Notifier(SettingsStore settings, IHttpClientFactory httpFactory, IL
         c.Timeout = TimeSpan.FromSeconds(15);
         return c;
     }
+
+    private static string E(string s) => TelegramClient.Escape(s);
 
     public static string FormatSize(long? bytes)
     {

@@ -14,6 +14,8 @@ public class SystemInfo
         ["mongodump", "--version"],
         ["redis-cli", "--version"],
         ["sqlite3", "--version"],
+        ["rclone", "version"],
+        ["age", "--version"],
     ];
 
     private Task<List<ToolVersion>>? _tools;

@@ -42,7 +42,7 @@ public class EngineTests
     {
         var t = new BackupTarget { Name = "n", Folder = "n", Engine = Engine.PostgreSql, Mode = ExecutionMode.Network, Host = "db", ExtraArgs = "--no-owner" };
         var cmd = DumpCommandBuilder.Build(t, new Credentials("app", "s3cret", "appdb"), "/tmp");
-        Assert.Equal(["pg_dump", "-h", "db", "-p", "5432", "-w", "-d", "appdb", "-U", "app", "--no-owner"], cmd.Argv);
+        Assert.Equal(["pg_dump", "-h", "db", "-p", "5432", "-w", "--clean", "--if-exists", "-d", "appdb", "-U", "app", "--no-owner"], cmd.Argv);
         Assert.Equal("s3cret", cmd.Env["PGPASSWORD"]);
         Assert.DoesNotContain(cmd.Argv, a => a.Contains("s3cret"));
     }
@@ -81,12 +81,12 @@ public class EngineTests
     [Fact]
     public void Labels_Parse_DefaultsAndDetection()
     {
-        var (cfg, err) = LabelConfig.Parse("acopy", new Dictionary<string, string>
+        var (cfgs, errs) = LabelConfig.Parse("acopy", new Dictionary<string, string>
         {
             ["acopy.enable"] = "true", ["acopy.keep"] = "4", ["acopy.naming"] = "rolling", ["acopy.schedule"] = "*/30 * * * *",
         }, "app-db", "postgres:17");
-        Assert.Null(err);
-        Assert.NotNull(cfg);
+        Assert.Empty(errs);
+        var cfg = Assert.Single(cfgs);
         Assert.Equal(Engine.PostgreSql, cfg.Engine);
         Assert.Equal(ExecutionMode.DockerExec, cfg.Mode);
         Assert.Equal(NamingMode.Rolling, cfg.Naming);
@@ -98,9 +98,9 @@ public class EngineTests
     [Fact]
     public void Labels_NotEnabled_IsIgnored()
     {
-        var (cfg, err) = LabelConfig.Parse("acopy", new Dictionary<string, string> { ["acopy.engine"] = "postgres" }, "x", "postgres");
-        Assert.Null(cfg);
-        Assert.Null(err);
+        var (cfgs, errs) = LabelConfig.Parse("acopy", new Dictionary<string, string> { ["acopy.engine"] = "postgres" }, "x", "postgres");
+        Assert.Empty(cfgs);
+        Assert.Empty(errs);
     }
 
     [Theory]
@@ -108,9 +108,9 @@ public class EngineTests
     [InlineData("acopy.engine", "oracle", "unknown engine")]
     public void Labels_Errors(string key, string value, string expected)
     {
-        var (cfg, err) = LabelConfig.Parse("acopy", new Dictionary<string, string> { ["acopy.enable"] = "true", [key] = value }, "x", "postgres");
-        Assert.Null(cfg);
-        Assert.Contains(expected, err);
+        var (cfgs, errs) = LabelConfig.Parse("acopy", new Dictionary<string, string> { ["acopy.enable"] = "true", [key] = value }, "x", "postgres");
+        Assert.Empty(cfgs);
+        Assert.Contains(expected, errs.Single());
     }
 
     [Fact]

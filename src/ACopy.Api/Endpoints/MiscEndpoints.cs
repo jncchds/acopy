@@ -18,7 +18,7 @@ public static class MiscEndpoints
 
         g.MapGet("/", async (int? targetId, string? status, int? limit, AppDbContext db) =>
         {
-            var q = db.Runs.AsNoTracking().Include(r => r.Target).AsQueryable();
+            var q = db.Runs.AsNoTracking().Include(r => r.Target).Include(r => r.Uploads).ThenInclude(u => u.Destination).AsQueryable();
             if (targetId != null) q = q.Where(r => r.TargetId == targetId);
             if (Enum.TryParse<RunStatus>(status, true, out var s)) q = q.Where(r => r.Status == s);
             var rows = await q.OrderByDescending(r => r.Id).Take(Math.Clamp(limit ?? 100, 1, 1000)).ToListAsync();
@@ -26,7 +26,7 @@ public static class MiscEndpoints
         });
 
         g.MapGet("/{id:long}", async (long id, AppDbContext db) =>
-            await db.Runs.AsNoTracking().Include(r => r.Target).FirstOrDefaultAsync(r => r.Id == id) is { } r
+            await db.Runs.AsNoTracking().Include(r => r.Target).Include(r => r.Uploads).ThenInclude(u => u.Destination).FirstOrDefaultAsync(r => r.Id == id) is { } r
                 ? Results.Ok(RunDto.From(r)) : Results.NotFound());
 
         g.MapGet("/{id:long}/download", async (long id, AppDbContext db, IOptions<PathsOptions> paths) =>
@@ -102,7 +102,7 @@ public static class MiscEndpoints
             try { dockerVersion = await docker.VersionAsync(ct); }
             catch (Exception e) { dockerError = e.Message; }
             if (dockerVersion == null && dockerError == null)
-                dockerError = dopt.Value.Enabled ? $"Socket {dopt.Value.Socket} not mounted" : "Disabled by configuration";
+                dockerError = dopt.Value.Enabled ? $"{docker.Endpoint} is not reachable (socket not mounted?)" : "Disabled by configuration";
             return new
             {
                 version = AppVersion.Value,
@@ -112,7 +112,7 @@ public static class MiscEndpoints
                 docker = new
                 {
                     available = dockerVersion != null, version = dockerVersion, error = dockerError,
-                    socket = dopt.Value.Socket, labelPrefix = dopt.Value.LabelPrefix,
+                    socket = docker.Endpoint, labelPrefix = dopt.Value.LabelPrefix,
                     lastScan = discovery.LastScan, scanError = discovery.LastError, issues = discovery.Issues,
                 },
                 tools = await info.ToolsAsync(),
@@ -165,7 +165,7 @@ public static class MiscEndpoints
     {
         api.MapGet("/settings", (SettingsStore s) => s.GetPublicAsync());
 
-        api.MapPut("/settings", async (SettingsInput input, SettingsStore s) =>
+        api.MapPut("/settings", async (SettingsInput input, SettingsStore s, Secrets secrets) =>
         {
             if (!TimeZoneInfo.TryFindSystemTimeZoneById(input.TimeZone.Trim(), out _))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["timeZone"] = ["Unknown time zone (use an IANA name like Europe/Berlin)"] });
@@ -174,6 +174,11 @@ public static class MiscEndpoints
             await s.SetAsync(SettingsStore.KeyTimeZone, input.TimeZone.Trim());
             await s.SetAsync(SettingsStore.KeyWebhookUrl, string.IsNullOrWhiteSpace(input.WebhookUrl) ? null : input.WebhookUrl.Trim());
             await s.SetAsync(SettingsStore.KeyNotifyOnSuccess, input.NotifyOnSuccess ? "true" : "false");
+            if (input.ClearTelegramToken == true) await s.SetAsync(SettingsStore.KeyTelegramToken, null);
+            else if (!string.IsNullOrWhiteSpace(input.TelegramToken)) await s.SetAsync(SettingsStore.KeyTelegramToken, secrets.Protect(input.TelegramToken.Trim()));
+            await s.SetAsync(SettingsStore.KeyTelegramChat, Blank(input.TelegramChatId));
+            await s.SetAsync(SettingsStore.KeyTelegramThread, Blank(input.TelegramThreadId));
+            await s.SetAsync(SettingsStore.KeyTelegramApi, Blank(input.TelegramApiUrl));
             return Results.Ok(await s.GetPublicAsync());
         });
 
@@ -184,6 +189,9 @@ public static class MiscEndpoints
             var err = await n.SendTestAsync(url);
             return err == null ? Results.NoContent() : Results.Problem($"Webhook failed: {err}", statusCode: 502);
         });
+
+        api.MapPost("/settings/test-telegram", async (Notifier n) =>
+            await n.SendTelegramTestAsync() is { } err ? Results.Problem($"Telegram failed: {err}", statusCode: 502) : Results.NoContent());
 
         api.MapGet("/timezones", () => TimeZoneInfo.GetSystemTimeZones().Select(z => z.Id).Order());
     }
@@ -236,6 +244,8 @@ public static class MiscEndpoints
             return Results.NoContent();
         }).RequireAuthorization();
     }
+
+    private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 
     private static Task SignInAsync(HttpContext ctx) => ctx.SignInAsync(
         CookieAuthenticationDefaults.AuthenticationScheme,

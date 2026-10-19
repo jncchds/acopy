@@ -4,7 +4,9 @@ using Microsoft.EntityFrameworkCore;
 
 namespace ACopy.Api.Services;
 
-public record AppSettingsDto(string TimeZone, string? WebhookUrl, bool NotifyOnSuccess);
+public record AppSettingsDto(
+    string TimeZone, string? WebhookUrl, bool NotifyOnSuccess,
+    bool TelegramHasToken, string? TelegramChatId, string? TelegramThreadId, string? TelegramApiUrl);
 
 /// <summary>Key/value settings in the database, edited from the Settings page.</summary>
 public class SettingsStore(IServiceScopeFactory scopes)
@@ -13,6 +15,10 @@ public class SettingsStore(IServiceScopeFactory scopes)
     public const string KeyWebhookUrl = "webhookUrl";
     public const string KeyNotifyOnSuccess = "notifyOnSuccess";
     public const string KeyPasswordHash = "auth.passwordHash";
+    public const string KeyTelegramToken = "telegram.botToken"; // Data Protection–encrypted
+    public const string KeyTelegramChat = "telegram.chatId";
+    public const string KeyTelegramThread = "telegram.threadId";
+    public const string KeyTelegramApi = "telegram.apiUrl";
 
     private Dictionary<string, string?>? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -42,7 +48,11 @@ public class SettingsStore(IServiceScopeFactory scopes)
     public async Task<AppSettingsDto> GetPublicAsync() => new(
         await GetTimeZoneIdAsync(),
         await GetAsync(KeyWebhookUrl),
-        await GetAsync(KeyNotifyOnSuccess) == "true");
+        await GetAsync(KeyNotifyOnSuccess) == "true",
+        !string.IsNullOrEmpty(await GetAsync(KeyTelegramToken)),
+        await GetAsync(KeyTelegramChat),
+        await GetAsync(KeyTelegramThread),
+        await GetAsync(KeyTelegramApi));
 
     public async Task<string> GetTimeZoneIdAsync()
     {

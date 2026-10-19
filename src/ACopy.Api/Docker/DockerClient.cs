@@ -26,30 +26,71 @@ public class DockerClient
     private readonly DockerOptions _opt;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
+    /// <summary>Human-readable endpoint, for the UI.</summary>
+    public string Endpoint { get; }
+    private readonly string? _unixPath;
+
     public DockerClient(IOptions<DockerOptions> opt)
     {
         _opt = opt.Value;
-        var handler = new SocketsHttpHandler
+        var host = !string.IsNullOrWhiteSpace(_opt.Host) ? _opt.Host.Trim()
+            : Environment.GetEnvironmentVariable("DOCKER_HOST") is { Length: > 0 } envHost ? envHost
+            : "unix://" + _opt.Socket;
+        Endpoint = host;
+
+        if (host.StartsWith("unix://", StringComparison.OrdinalIgnoreCase))
         {
-            ConnectCallback = async (_, ct) =>
+            _unixPath = host["unix://".Length..];
+            var handler = new SocketsHttpHandler
             {
-                var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-                try
+                ConnectCallback = async (_, ct) =>
                 {
-                    await socket.ConnectAsync(new UnixDomainSocketEndPoint(_opt.Socket), ct);
-                    return new NetworkStream(socket, ownsSocket: true);
-                }
-                catch
+                    var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    try
+                    {
+                        await socket.ConnectAsync(new UnixDomainSocketEndPoint(_unixPath), ct);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch
+                    {
+                        socket.Dispose();
+                        throw;
+                    }
+                },
+            };
+            _http = new HttpClient(handler) { BaseAddress = new Uri("http://docker/"), Timeout = Timeout.InfiniteTimeSpan };
+        }
+        else if (host.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase) || host.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            var tls = _opt.Tls || Environment.GetEnvironmentVariable("DOCKER_TLS_VERIFY") == "1" || host.StartsWith("https", StringComparison.OrdinalIgnoreCase);
+            var authority = host[(host.IndexOf("://", StringComparison.Ordinal) + 3)..].TrimEnd('/');
+            var handler = new SocketsHttpHandler();
+            if (tls)
+            {
+                var certDir = _opt.CertPath ?? Environment.GetEnvironmentVariable("DOCKER_CERT_PATH");
+                if (!string.IsNullOrEmpty(certDir))
                 {
-                    socket.Dispose();
-                    throw;
+                    var client = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPemFile(
+                        Path.Combine(certDir, "cert.pem"), Path.Combine(certDir, "key.pem"));
+                    var ca = System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificateFromFile(Path.Combine(certDir, "ca.pem"));
+                    handler.SslOptions.ClientCertificates = [client];
+                    handler.SslOptions.RemoteCertificateValidationCallback = (_, cert, _, _) =>
+                    {
+                        if (cert == null) return false;
+                        using var chain = new System.Security.Cryptography.X509Certificates.X509Chain();
+                        chain.ChainPolicy.TrustMode = System.Security.Cryptography.X509Certificates.X509ChainTrustMode.CustomRootTrust;
+                        chain.ChainPolicy.CustomTrustStore.Add(ca);
+                        chain.ChainPolicy.RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
+                        return chain.Build(new System.Security.Cryptography.X509Certificates.X509Certificate2(cert));
+                    };
                 }
-            },
-        };
-        _http = new HttpClient(handler) { BaseAddress = new Uri("http://docker/"), Timeout = Timeout.InfiniteTimeSpan };
+            }
+            _http = new HttpClient(handler) { BaseAddress = new Uri($"{(tls ? "https" : "http")}://{authority}/"), Timeout = Timeout.InfiniteTimeSpan };
+        }
+        else throw new InvalidOperationException($"Unsupported Docker host '{host}' — use unix:///path or tcp://host:port");
     }
 
-    public bool Configured => _opt.Enabled && File.Exists(_opt.Socket);
+    public bool Configured => _opt.Enabled && (_unixPath == null || File.Exists(_unixPath));
 
     public async Task<string?> VersionAsync(CancellationToken ct)
     {
@@ -123,6 +164,40 @@ public class DockerClient
 
         var inspect = await _http.GetFromJsonAsync<JsonElement>($"exec/{execId}/json", Json, ct);
         return inspect.TryGetProperty("ExitCode", out var code) && code.ValueKind == JsonValueKind.Number ? code.GetInt64() : -1;
+    }
+
+    /// <summary>
+    /// Copies a local file into the container as <paramref name="containerDir"/>/<paramref name="name"/> (mode 0644,
+    /// so non-root database processes can read it), via the archive endpoint — no tools needed in the container.
+    /// </summary>
+    public async Task PutFileAsync(string containerId, string localFile, string containerDir, string name, CancellationToken ct)
+    {
+        var tarPath = localFile + ".tar";
+        try
+        {
+            await using (var tarFile = File.Create(tarPath))
+            await using (var writer = new System.Formats.Tar.TarWriter(tarFile, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: false))
+            {
+                await using var data = File.OpenRead(localFile);
+                var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, name)
+                {
+                    DataStream = data,
+                    Mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead,
+                    ModificationTime = DateTimeOffset.UtcNow,
+                };
+                await writer.WriteEntryAsync(entry, ct);
+            }
+            await using var body = File.OpenRead(tarPath);
+            using var content = new StreamContent(body);
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-tar");
+            using var res = await _http.PutAsync($"containers/{Uri.EscapeDataString(containerId)}/archive?path={Uri.EscapeDataString(containerDir)}", content, ct);
+            if (!res.IsSuccessStatusCode)
+                throw new InvalidOperationException($"Copying the file into the container failed: {(int)res.StatusCode} {await res.Content.ReadAsStringAsync(ct)}");
+        }
+        finally
+        {
+            try { File.Delete(tarPath); } catch { /* best effort */ }
+        }
     }
 
     /// <summary>Docker's multiplexed stream: 8-byte header [type,0,0,0,len BE32] then payload.</summary>

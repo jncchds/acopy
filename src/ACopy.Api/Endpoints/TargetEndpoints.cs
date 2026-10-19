@@ -14,13 +14,13 @@ public static class TargetEndpoints
 
         g.MapGet("/", async (AppDbContext db, BackupRunner runner, SettingsStore settings) =>
         {
-            var targets = await db.Targets.AsNoTracking().OrderBy(t => t.Name).ToListAsync();
+            var targets = await db.Targets.AsNoTracking().Include(t => t.EncryptionKey).Include(t => t.Destinations).OrderBy(t => t.Name).ToListAsync();
             return await ToDtos(db, runner, settings, targets);
         });
 
         g.MapGet("/{id:int}", async (int id, AppDbContext db, BackupRunner runner, SettingsStore settings) =>
         {
-            var t = await db.Targets.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id);
+            var t = await db.Targets.AsNoTracking().Include(x => x.EncryptionKey).Include(x => x.Destinations).FirstOrDefaultAsync(x => x.Id == id);
             return t == null ? Results.NotFound() : Results.Ok((await ToDtos(db, runner, settings, [t]))[0]);
         });
 
@@ -28,27 +28,31 @@ public static class TargetEndpoints
         {
             var errors = input.Validate();
             if (await db.Targets.AnyAsync(t => t.Name == input.Name.Trim())) errors["name"] = ["A target with this name already exists"];
+            await ValidateRefs(db, input, errors);
             if (errors.Count > 0) return Results.ValidationProblem(errors);
             var t = new BackupTarget { Name = input.Name.Trim(), Folder = "" };
             Apply(t, input, runner);
             db.Targets.Add(t);
             await db.SaveChangesAsync();
+            await db.Entry(t).Reference(x => x.EncryptionKey).LoadAsync();
             return Results.Ok((await ToDtos(db, runner, settings, [t]))[0]);
         });
 
         g.MapPut("/{id:int}", async (int id, TargetInput input, AppDbContext db, BackupRunner runner, SettingsStore settings) =>
         {
-            var t = await db.Targets.FindAsync(id);
+            var t = await db.Targets.Include(x => x.Destinations).FirstOrDefaultAsync(x => x.Id == id);
             if (t == null) return Results.NotFound();
             if (t.Source == TargetSource.DockerLabel) return Results.Problem("This target is configured by Docker labels — edit the labels instead.", statusCode: 409);
             var errors = input.Validate();
             if (await db.Targets.AnyAsync(x => x.Id != id && x.Name == input.Name.Trim())) errors["name"] = ["A target with this name already exists"];
+            await ValidateRefs(db, input, errors);
             if (errors.Count > 0) return Results.ValidationProblem(errors);
             var oldKeep = t.Keep;
             Apply(t, input, runner);
             if (t.Keep != oldKeep && t.NextSlot >= t.Keep) t.NextSlot = 0;
             t.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync();
+            await db.Entry(t).Reference(x => x.EncryptionKey).LoadAsync();
             return Results.Ok((await ToDtos(db, runner, settings, [t]))[0]);
         });
 
@@ -130,6 +134,20 @@ public static class TargetEndpoints
         t.Compression = i.Compression;
         t.Folder = BackupFiles.SafeFolder(string.IsNullOrWhiteSpace(i.Folder) ? t.Name : i.Folder);
         t.TimeoutMinutes = i.TimeoutMinutes ?? 120;
+        t.MaxAgeDays = t.Naming == NamingMode.Timestamp ? i.MaxAgeDays : null;
+        t.EncryptionKeyId = i.EncryptionKeyId;
+        t.RestoreCommand = Blank(i.RestoreCommand);
+        var wanted = (i.DestinationIds ?? []).Distinct().ToList();
+        t.Destinations.RemoveAll(d => !wanted.Contains(d.DestinationId));
+        foreach (var id in wanted.Where(id => t.Destinations.All(d => d.DestinationId != id)))
+            t.Destinations.Add(new TargetDestination { DestinationId = id });
+    }
+
+    private static async Task ValidateRefs(AppDbContext db, TargetInput input, Dictionary<string, string[]> errors)
+    {
+        if (input.EncryptionKeyId is { } kid && !await db.Keys.AnyAsync(k => k.Id == kid)) errors["encryptionKeyId"] = ["Unknown encryption key"];
+        foreach (var did in input.DestinationIds ?? [])
+            if (!await db.Destinations.AnyAsync(d => d.Id == did)) { errors["destinationIds"] = ["Unknown destination"]; break; }
     }
 
     private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
@@ -143,10 +161,10 @@ public static class TargetEndpoints
         var lastRunIds = await db.Runs.Where(r => ids.Contains(r.TargetId))
             .GroupBy(r => r.TargetId).Select(g => g.Max(r => r.Id)).ToListAsync();
         var lastRuns = await db.Runs.AsNoTracking().Where(r => lastRunIds.Contains(r.Id)).ToDictionaryAsync(r => r.TargetId);
-        var lastOk = (await db.Runs.Where(r => ids.Contains(r.TargetId) && r.Status == RunStatus.Succeeded)
+        var lastOk = (await db.Runs.Where(r => ids.Contains(r.TargetId) && r.Status == RunStatus.Succeeded && r.Kind == RunKind.Backup)
                 .Select(r => new { r.TargetId, r.StartedAt }).ToListAsync())
             .GroupBy(r => r.TargetId).ToDictionary(g => g.Key, g => g.Max(r => r.StartedAt));
-        var stored = (await db.Runs.Where(r => ids.Contains(r.TargetId) && r.Status == RunStatus.Succeeded && !r.FileGone)
+        var stored = (await db.Runs.Where(r => ids.Contains(r.TargetId) && r.Status == RunStatus.Succeeded && !r.FileGone && r.Kind == RunKind.Backup)
                 .Select(r => new { r.TargetId, r.SizeBytes }).ToListAsync())
             .GroupBy(r => r.TargetId).ToDictionary(g => g.Key, g => (Bytes: g.Sum(r => r.SizeBytes ?? 0), Files: g.Count()));
 

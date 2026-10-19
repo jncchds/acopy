@@ -11,6 +11,15 @@ public class DockerOptions
 {
     public bool Enabled { get; set; } = true;
     public string Socket { get; set; } = "/var/run/docker.sock";
+    /// <summary>
+    /// Docker endpoint: <c>unix:///path</c> or <c>tcp://host:port</c> (e.g. a socket proxy). Empty = the
+    /// standard DOCKER_HOST variable, then <see cref="Socket"/>.
+    /// </summary>
+    public string? Host { get; set; }
+    /// <summary>tcp: use TLS (also on when DOCKER_TLS_VERIFY=1).</summary>
+    public bool Tls { get; set; }
+    /// <summary>tcp + TLS: directory with ca.pem, cert.pem, key.pem (default DOCKER_CERT_PATH).</summary>
+    public string? CertPath { get; set; }
     public string LabelPrefix { get; set; } = "acopy";
     public int ScanSeconds { get; set; } = 60;
 }

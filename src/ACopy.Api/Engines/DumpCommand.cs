@@ -38,8 +38,8 @@ public static class DumpCommandBuilder
             case Engine.PostgreSql:
             {
                 var argv = new List<string>();
-                if (string.IsNullOrEmpty(db)) argv.AddRange(["pg_dumpall", "-h", host, "-p", port, "-w"]);
-                else argv.AddRange(["pg_dump", "-h", host, "-p", port, "-w", "-d", db]);
+                if (string.IsNullOrEmpty(db)) argv.AddRange(["pg_dumpall", "-h", host, "-p", port, "-w", "--clean", "--if-exists"]);
+                else argv.AddRange(["pg_dump", "-h", host, "-p", port, "-w", "--clean", "--if-exists", "-d", db]);
                 if (!string.IsNullOrEmpty(c.User)) argv.AddRange(["-U", c.User]);
                 argv.AddRange(extra);
                 return new() { Argv = argv, Env = PasswordEnv("PGPASSWORD", c.Password) };
@@ -113,8 +113,8 @@ public static class DumpCommandBuilder
             case Engine.PostgreSql:
             {
                 var argv = new List<string>();
-                if (string.IsNullOrEmpty(db)) argv.AddRange(["pg_dumpall", "-w"]);
-                else argv.AddRange(["pg_dump", "-w", "-d", db]);
+                if (string.IsNullOrEmpty(db)) argv.AddRange(["pg_dumpall", "-w", "--clean", "--if-exists"]);
+                else argv.AddRange(["pg_dump", "-w", "--clean", "--if-exists", "-d", db]);
                 if (!string.IsNullOrEmpty(c.User)) argv.AddRange(["-U", c.User]);
                 argv.AddRange(extra);
                 return new() { Argv = argv, Env = PasswordEnv("PGPASSWORD", c.Password) };

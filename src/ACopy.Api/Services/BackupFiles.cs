@@ -7,6 +7,10 @@ using ACopy.Api.Engines;
 namespace ACopy.Api.Services;
 
 /// <summary>File naming, temp files and retention. Pure functions over a directory — no database.</summary>
+public record RetentionPolicy(int Keep, int? MaxAgeDays);
+
+public record FileEntry(string Name, DateTime ModifiedUtc);
+
 public static partial class BackupFiles
 {
     public const string TimestampFormat = "yyyyMMdd-HHmmss";
@@ -34,10 +38,10 @@ public static partial class BackupFiles
     /// <summary>Base name of the files inside the folder (slug of the target name).</summary>
     public static string BaseName(BackupTarget t) => Slug(t.Name);
 
-    public static string FileName(BackupTarget t, DateTime localNow, int slot) => t.Naming switch
+    public static string FileName(BackupTarget t, DateTime localNow, int slot, KeyKind? encryption = null) => t.Naming switch
     {
-        NamingMode.Rolling => $"{BaseName(t)}.{slot}.{EngineCatalog.FileExtension(t)}",
-        _ => $"{BaseName(t)}_{localNow.ToString(TimestampFormat, CultureInfo.InvariantCulture)}.{EngineCatalog.FileExtension(t)}",
+        NamingMode.Rolling => $"{BaseName(t)}.{slot}.{EngineCatalog.FileExtension(t, encryption)}",
+        _ => $"{BaseName(t)}_{localNow.ToString(TimestampFormat, CultureInfo.InvariantCulture)}.{EngineCatalog.FileExtension(t, encryption)}",
     };
 
     public static string TempName(string finalFileName) => $"{TempPrefix}{finalFileName}{TempSuffix}";
@@ -54,44 +58,61 @@ public static partial class BackupFiles
     }
 
     /// <summary>
-    /// Files that belong to this target and should be deleted to honour Keep. Only names this target
-    /// would have produced are ever considered — anything else in the folder is left alone.
+    /// Files that belong to this target and should be deleted to honour the retention policy. Only names this
+    /// target would have produced are ever considered — anything else in the folder is left alone.
+    /// Timestamp naming: beyond the newest <c>Keep</c>, or older than <c>MaxAgeDays</c>; the newest file is always kept.
+    /// Rolling naming: slots ≥ Keep (Keep was lowered), or the written slot under an old extension.
     /// </summary>
-    public static List<string> FilesToPrune(BackupTarget t, IEnumerable<string> fileNamesInFolder, string? justWritten)
+    public static List<string> FilesToPrune(
+        string baseName, NamingMode naming, RetentionPolicy policy, IEnumerable<FileEntry> files, string? justWritten, DateTime nowUtc)
     {
-        var names = fileNamesInFolder.ToList();
-        var baseName = Regex.Escape(BaseName(t));
-        var keep = Math.Max(1, t.Keep);
+        var list = files.ToList();
+        var escaped = Regex.Escape(baseName);
 
-        if (t.Naming == NamingMode.Timestamp)
+        if (naming == NamingMode.Timestamp)
         {
-            var rx = new Regex($"^{baseName}_(\\d{{8}}-\\d{{6}})\\..+$");
-            return names
-                .Select(n => (n, m: rx.Match(n)))
+            var rx = new Regex($@"^{escaped}_(\d{{8}}-\d{{6}})\..+$");
+            var ordered = list
+                .Select(f => (f, m: rx.Match(f.Name)))
                 .Where(x => x.m.Success)
                 .OrderByDescending(x => x.m.Groups[1].Value, StringComparer.Ordinal)
-                .ThenByDescending(x => x.n == justWritten)
-                .Skip(keep)
-                .Select(x => x.n)
+                .ThenByDescending(x => x.f.Name == justWritten)
+                .Select(x => x.f)
                 .ToList();
+            var result = new List<string>();
+            for (var i = 1; i < ordered.Count; i++)
+            {
+                var beyondCount = policy.Keep > 0 && i >= policy.Keep;
+                var tooOld = policy.MaxAgeDays is > 0 && nowUtc - ordered[i].ModifiedUtc > TimeSpan.FromDays(policy.MaxAgeDays.Value);
+                if (beyondCount || tooOld) result.Add(ordered[i].Name);
+            }
+            return result;
         }
         else
         {
-            var rx = new Regex($"^{baseName}\\.(\\d+)\\..+$");
+            var keep = Math.Max(1, policy.Keep);
+            var rx = new Regex($@"^{escaped}\.(\d+)\..+$");
             var result = new List<string>();
             int? writtenSlot = null;
             if (justWritten != null && rx.Match(justWritten) is { Success: true } wm) writtenSlot = int.Parse(wm.Groups[1].Value);
-            foreach (var n in names)
+            foreach (var f in list)
             {
-                var m = rx.Match(n);
-                if (!m.Success || n == justWritten) continue;
+                var m = rx.Match(f.Name);
+                if (!m.Success || f.Name == justWritten) continue;
                 if (!int.TryParse(m.Groups[1].Value, out var slot)) continue;
-                // Slots beyond Keep (Keep was lowered), or the same slot under an old extension (compression changed)
-                if (slot >= keep || slot == writtenSlot) result.Add(n);
+                if (slot >= keep || slot == writtenSlot) result.Add(f.Name);
             }
             return result;
         }
     }
+
+    public static List<string> FilesToPrune(BackupTarget t, IEnumerable<FileEntry> files, string? justWritten, DateTime nowUtc) =>
+        FilesToPrune(BaseName(t), t.Naming, new RetentionPolicy(t.Keep, t.MaxAgeDays), files, justWritten, nowUtc);
+
+    public static List<FileEntry> ListFolder(string folder) =>
+        Directory.Exists(folder)
+            ? new DirectoryInfo(folder).EnumerateFiles().Select(f => new FileEntry(f.Name, f.LastWriteTimeUtc)).ToList()
+            : [];
 
     /// <summary>Every backup file in the folder this target produced (any timestamp or slot, any extension).</summary>
     public static List<string> OwnedFiles(BackupTarget t, IEnumerable<string> fileNamesInFolder)

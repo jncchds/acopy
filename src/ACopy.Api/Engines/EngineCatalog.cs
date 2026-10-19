@@ -98,16 +98,17 @@ public static class EngineCatalog
         }
     }
 
-    public static string FileExtension(BackupTarget t)
+    public static string FileExtension(BackupTarget t, KeyKind? encryption = null)
     {
         var ext = t.Engine == Engine.Custom && !string.IsNullOrWhiteSpace(t.CustomExtension)
             ? t.CustomExtension.Trim().TrimStart('.')
             : Get(t.Engine).Extension;
-        return t.Compression switch
+        ext = t.Compression switch
         {
             Compression.Gzip => ext + ".gz",
             Compression.Brotli => ext + ".br",
             _ => ext,
         };
+        return encryption == null ? ext : ext + "." + Services.Encryption.Extension(encryption.Value);
     }
 }

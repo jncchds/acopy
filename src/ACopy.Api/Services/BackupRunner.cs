@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using ACopy.Api.Data;
+using ACopy.Api.Destinations;
 using ACopy.Api.Docker;
 using ACopy.Api.Engines;
 using Microsoft.AspNetCore.DataProtection;
@@ -13,9 +14,15 @@ using Microsoft.Extensions.Options;
 
 namespace ACopy.Api.Services;
 
+/// <param name="SafetyBackup">Take a fresh backup of the current state before restoring.</param>
+/// <param name="AgeIdentity">age private key, when the key in ACopy has none stored.</param>
+/// <param name="FromUploadId">Restore from this remote copy instead of the local file.</param>
+public record RestoreOptions(bool SafetyBackup, string? AgeIdentity, long? FromUploadId);
+
 /// <summary>
-/// Executes backups: resolves credentials, runs the dump (locally or via docker exec), compresses into a
-/// Syncthing-invisible temp file, renames atomically, applies retention, records the run, notifies.
+/// Executes backups and restores. A backup: resolve credentials → run the dump (locally or via docker exec) →
+/// compress → encrypt → Syncthing-invisible temp file → atomic rename → local retention → copy to destinations →
+/// remote retention → record → notify. A restore runs the pipeline backwards into the database.
 /// One run per target at a time; at most <see cref="BackupOptions.MaxParallel"/> runs overall.
 /// </summary>
 public class BackupRunner
@@ -23,8 +30,10 @@ public class BackupRunner
     private readonly IServiceScopeFactory _scopes;
     private readonly DockerClient _docker;
     private readonly IDataProtector _protector;
+    private readonly Secrets _secrets;
     private readonly SettingsStore _settings;
     private readonly Notifier _notifier;
+    private readonly DestinationService _destinations;
     private readonly PathsOptions _paths;
     private readonly BackupOptions _opt;
     private readonly ILogger<BackupRunner> _log;
@@ -32,14 +41,16 @@ public class BackupRunner
     private readonly ConcurrentDictionary<int, (long RunId, CancellationTokenSource Cts)> _active = new();
 
     public BackupRunner(
-        IServiceScopeFactory scopes, DockerClient docker, IDataProtectionProvider dp, SettingsStore settings,
-        Notifier notifier, IOptions<PathsOptions> paths, IOptions<BackupOptions> opt, ILogger<BackupRunner> log)
+        IServiceScopeFactory scopes, DockerClient docker, IDataProtectionProvider dp, Secrets secrets, SettingsStore settings,
+        Notifier notifier, DestinationService destinations, IOptions<PathsOptions> paths, IOptions<BackupOptions> opt, ILogger<BackupRunner> log)
     {
         _scopes = scopes;
         _docker = docker;
         _protector = dp.CreateProtector("ACopy.TargetPassword");
+        _secrets = secrets;
         _settings = settings;
         _notifier = notifier;
+        _destinations = destinations;
         _paths = paths.Value;
         _opt = opt.Value;
         _log = log;
@@ -50,7 +61,6 @@ public class BackupRunner
     public string? Unprotect(string? cipher) => string.IsNullOrEmpty(cipher) ? null : _protector.Unprotect(cipher);
 
     public bool IsActive(int targetId) => _active.ContainsKey(targetId);
-    public IReadOnlyCollection<int> ActiveTargetIds => _active.Keys.ToList();
 
     public bool Cancel(int targetId)
     {
@@ -59,18 +69,69 @@ public class BackupRunner
         return true;
     }
 
-    /// <summary>Queue a run. Returns the run id, or null when the target already has one in flight.</summary>
-    public async Task<long?> StartAsync(int targetId, RunTrigger trigger)
+    private static string WorkDir()
+    {
+        var d = Path.Combine(Path.GetTempPath(), "acopy");
+        Directory.CreateDirectory(d);
+        return d;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Queueing
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>Queue a backup. Returns the run id, or null when the target already has a run in flight.</summary>
+    public Task<long?> StartAsync(int targetId, RunTrigger trigger) =>
+        StartCoreAsync(targetId, new BackupRun { TargetId = targetId, Kind = RunKind.Backup, Trigger = trigger },
+            (runId, ct) => RunBackupCoreAsync(targetId, runId, ct));
+
+    /// <summary>Queue a restore of <paramref name="sourceRunId"/>'s file. Null when the target is busy.</summary>
+    public async Task<long?> StartRestoreAsync(long sourceRunId, RestoreOptions options)
     {
         using var scope = _scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var target = await db.Targets.FindAsync(targetId) ?? throw new KeyNotFoundException();
+        var source = await db.Runs.AsNoTracking().FirstOrDefaultAsync(r => r.Id == sourceRunId) ?? throw new KeyNotFoundException();
+        var targetId = source.TargetId;
+        return await StartCoreAsync(targetId,
+            new BackupRun { TargetId = targetId, Kind = RunKind.Restore, Trigger = RunTrigger.Manual, SourceRunId = sourceRunId, FilePath = source.FilePath },
+            async (runId, ct) =>
+            {
+                if (options.SafetyBackup)
+                {
+                    long safetyId;
+                    using (var s = _scopes.CreateScope())
+                    {
+                        var sdb = s.ServiceProvider.GetRequiredService<AppDbContext>();
+                        var safety = new BackupRun { TargetId = targetId, Kind = RunKind.Backup, Trigger = RunTrigger.SafetyBackup, Status = RunStatus.Queued, StartedAt = DateTimeOffset.UtcNow };
+                        sdb.Runs.Add(safety);
+                        await sdb.SaveChangesAsync(CancellationToken.None);
+                        safetyId = safety.Id;
+                    }
+                    await RunBackupCoreAsync(targetId, safetyId, ct);
+                    using var s2 = _scopes.CreateScope();
+                    var status = await s2.ServiceProvider.GetRequiredService<AppDbContext>().Runs.Where(r => r.Id == safetyId).Select(r => r.Status).FirstAsync(CancellationToken.None);
+                    if (status != RunStatus.Succeeded)
+                    {
+                        await FinishAsync(runId, RunStatus.Failed, $"Safety backup (run #{safetyId}) did not succeed — nothing was restored", null);
+                        return;
+                    }
+                }
+                await RunRestoreCoreAsync(runId, options, ct);
+            });
+    }
+
+    private async Task<long?> StartCoreAsync(int targetId, BackupRun run, Func<long, CancellationToken, Task> work)
+    {
+        using var scope = _scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        if (!await db.Targets.AnyAsync(t => t.Id == targetId)) throw new KeyNotFoundException();
 
         var cts = new CancellationTokenSource();
-        var run = new BackupRun { TargetId = targetId, Status = RunStatus.Queued, Trigger = trigger, StartedAt = DateTimeOffset.UtcNow };
         if (!_active.TryAdd(targetId, (0, cts))) { cts.Dispose(); return null; }
         try
         {
+            run.Status = RunStatus.Queued;
+            run.StartedAt = DateTimeOffset.UtcNow;
             db.Runs.Add(run);
             await db.SaveChangesAsync();
             _active[targetId] = (run.Id, cts);
@@ -82,16 +143,16 @@ public class BackupRunner
             throw;
         }
 
-        _ = Task.Run(() => ExecuteAsync(targetId, run.Id, cts));
+        _ = Task.Run(() => ExecuteAsync(targetId, run.Id, cts, work));
         return run.Id;
     }
 
-    private async Task ExecuteAsync(int targetId, long runId, CancellationTokenSource cts)
+    private async Task ExecuteAsync(int targetId, long runId, CancellationTokenSource cts, Func<long, CancellationToken, Task> work)
     {
         try
         {
             await _parallel.WaitAsync(cts.Token);
-            try { await RunCoreAsync(targetId, runId, cts.Token); }
+            try { await work(runId, cts.Token); }
             finally { _parallel.Release(); }
         }
         catch (OperationCanceledException)
@@ -100,7 +161,7 @@ public class BackupRunner
         }
         catch (Exception e)
         {
-            _log.LogError(e, "Backup run {RunId} crashed", runId);
+            _log.LogError(e, "Run {RunId} crashed", runId);
             await FinishAsync(runId, RunStatus.Failed, e.Message, null);
         }
         finally
@@ -110,11 +171,16 @@ public class BackupRunner
         }
     }
 
-    private async Task RunCoreAsync(int targetId, long runId, CancellationToken cancel)
+    // ════════════════════════════════════════════════════════════════
+    //  Backup
+    // ════════════════════════════════════════════════════════════════
+
+    private async Task RunBackupCoreAsync(int targetId, long runId, CancellationToken cancel)
     {
         using var scope = _scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var target = await db.Targets.FirstAsync(t => t.Id == targetId);
+        var target = await db.Targets.Include(t => t.EncryptionKey).Include(t => t.Destinations).ThenInclude(d => d.Destination)
+            .FirstAsync(t => t.Id == targetId);
         var run = await db.Runs.FirstAsync(r => r.Id == runId);
         run.Status = RunStatus.Running;
         run.StartedAt = DateTimeOffset.UtcNow;
@@ -131,46 +197,74 @@ public class BackupRunner
         var folder = Path.Combine(_paths.Backups, folderRel);
         Directory.CreateDirectory(folder);
 
+        var key = target.EncryptionKey;
         var slot = target.Naming == NamingMode.Rolling ? Math.Clamp(target.NextSlot, 0, Math.Max(1, target.Keep) - 1) : (int?)null;
-        var fileName = BackupFiles.FileName(target, localNow, slot ?? 0);
+        var fileName = BackupFiles.FileName(target, localNow, slot ?? 0, key?.Kind);
         var finalPath = Path.Combine(folder, fileName);
         var tempPath = Path.Combine(folder, BackupFiles.TempName(fileName));
-        var workDir = Path.Combine(Path.GetTempPath(), "acopy");
-        Directory.CreateDirectory(workDir);
+        var workDir = WorkDir();
 
         DumpCommand? cmd = null;
+        var succeeded = false;
         try
         {
             var (creds, containerId) = await ResolveAsync(target, log, ct);
             cmd = DumpCommandBuilder.Build(target, creds, workDir);
             long rawBytes;
 
-            await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+            AgeProcess? age = null;
+            try
             {
-                await using var compressed = Compress(file, target.Compression);
-                var counting = new CountingStream(compressed);
-                if (cmd.SqliteSourcePath != null) await SqliteBackupAsync(cmd.SqliteSourcePath, workDir, counting, ct);
-                else if (target.Mode == ExecutionMode.DockerExec) await ExecInContainerAsync(containerId!, cmd, counting, log, ct);
-                else await RunProcessAsync(cmd, counting, log, ct);
-                rawBytes = counting.Written;
+                await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+                {
+                    Stream sink = file;
+                    if (key?.Kind == KeyKind.Age)
+                    {
+                        // age writes the ciphertext itself; we stream compressed plaintext into its stdin
+                        file.Close();
+                        age = Encryption.StartAgeEncrypt(Encryption.ParseRecipients(key.Recipients), tempPath);
+                        sink = new NonClosingStream(age.Input); // CompleteAsync closes stdin
+                    }
+                    else if (key?.Kind == KeyKind.Passphrase)
+                    {
+                        var pass = _secrets.Unprotect(key.SecretProtected) ?? throw new InvalidOperationException($"Key '{key.Name}' has no passphrase");
+                        sink = Encryption.PassphraseEncrypt(file, pass);
+                    }
+
+                    await using (var encrypted = sink == file ? new NonClosingStream(file) : sink)
+                    await using (var compressed = Compress(encrypted, target.Compression))
+                    {
+                        var counting = new CountingStream(compressed);
+                        if (cmd.SqliteSourcePath != null) await SqliteBackupAsync(cmd.SqliteSourcePath, workDir, counting, ct);
+                        else if (target.Mode == ExecutionMode.DockerExec) await ExecInContainerAsync(containerId!, cmd, counting, log, ct);
+                        else await RunProcessAsync(cmd, counting, log, ct);
+                        rawBytes = counting.Written;
+                    }
+                }
+                if (age != null) await age.CompleteAsync(ct);
+            }
+            finally
+            {
+                if (age != null) await age.DisposeAsync();
             }
 
             if (rawBytes == 0) throw new InvalidOperationException("The dump produced no output");
+            if (key != null) log.AppendLine($"encrypted with key '{key.Name}' ({key.Kind})");
 
             File.Move(tempPath, finalPath, overwrite: true);
-            var info = new FileInfo(finalPath);
             run.FilePath = Path.Combine(folderRel, fileName).Replace('\\', '/');
-            run.SizeBytes = info.Length;
+            run.SizeBytes = new FileInfo(finalPath).Length;
             run.Sha256 = await HashAsync(finalPath, CancellationToken.None);
             run.Slot = slot;
+            run.EncryptionKeyId = key?.Id;
 
             // A rolling slot overwrote an older run's file
-            await db.Runs.Where(r => r.TargetId == targetId && r.Id != runId && r.FilePath == run.FilePath)
+            await db.Runs.Where(r => r.TargetId == targetId && r.Id != runId && r.FilePath == run.FilePath && r.Kind == RunKind.Backup)
                 .ExecuteUpdateAsync(s => s.SetProperty(r => r.FileGone, true), CancellationToken.None);
 
             if (slot != null) target.NextSlot = (slot.Value + 1) % Math.Max(1, target.Keep);
 
-            var pruned = BackupFiles.FilesToPrune(target, Directory.EnumerateFiles(folder).Select(Path.GetFileName)!, fileName);
+            var pruned = BackupFiles.FilesToPrune(target, BackupFiles.ListFolder(folder), fileName, DateTime.UtcNow);
             foreach (var p in pruned)
             {
                 try { File.Delete(Path.Combine(folder, p)); log.AppendLine($"retention: deleted {p}"); }
@@ -179,11 +273,12 @@ public class BackupRunner
             if (pruned.Count > 0)
             {
                 var gone = pruned.Select(p => Path.Combine(folderRel, p).Replace('\\', '/')).ToList();
-                await db.Runs.Where(r => r.TargetId == targetId && r.FilePath != null && gone.Contains(r.FilePath))
+                await db.Runs.Where(r => r.TargetId == targetId && r.FilePath != null && gone.Contains(r.FilePath) && r.Kind == RunKind.Backup)
                     .ExecuteUpdateAsync(s => s.SetProperty(r => r.FileGone, true), CancellationToken.None);
             }
 
             run.Status = RunStatus.Succeeded;
+            succeeded = true;
         }
         catch (Exception e)
         {
@@ -204,11 +299,278 @@ public class BackupRunner
         }
 
         run.FinishedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(CancellationToken.None);
+
+        if (succeeded) await UploadAsync(db, target, run, finalPath, folderRel, fileName, log, ct);
+
         run.Log = Truncate(log.ToString());
         await db.SaveChangesAsync(CancellationToken.None);
         await PruneHistoryAsync(db, targetId);
         await _notifier.NotifyAsync(target, run);
     }
+
+    /// <summary>Copies the finished file to each enabled destination, then applies that destination's retention.</summary>
+    private async Task UploadAsync(AppDbContext db, BackupTarget target, BackupRun run, string localPath, string folderRel, string fileName, StringBuilder log, CancellationToken ct)
+    {
+        foreach (var td in target.Destinations.Where(d => d.Destination is { Enabled: true }))
+        {
+            var d = td.Destination!;
+            var upload = new RunUpload { RunId = run.Id, DestinationId = d.Id, Destination = d, Status = UploadStatus.Pending };
+            run.Uploads.Add(upload);
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                upload.RemoteRef = await _destinations.UploadAsync(d, target, run, localPath, folderRel, fileName, ct);
+                upload.Status = UploadStatus.Succeeded;
+                log.AppendLine($"{d.Name}: uploaded in {sw.Elapsed.TotalSeconds:0.#} s");
+            }
+            catch (Exception e)
+            {
+                upload.Status = UploadStatus.Failed;
+                upload.Error = e is OperationCanceledException ? "Timed out" : e.Message;
+                log.AppendLine($"{d.Name}: upload failed: {upload.Error}");
+            }
+            upload.FinishedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(CancellationToken.None);
+
+            if (upload.Status == UploadStatus.Succeeded)
+            {
+                try { await _destinations.PruneAsync(d, target, folderRel, fileName, db, log, ct); }
+                catch (Exception e) { log.AppendLine($"{d.Name}: retention failed: {e.Message}"); }
+            }
+        }
+    }
+
+    /// <summary>Re-sends one failed (or deleted) upload of an existing local file.</summary>
+    public async Task<RunUpload> RetryUploadAsync(long uploadId, CancellationToken ct)
+    {
+        using var scope = _scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var u = await db.Uploads.Include(x => x.Destination).Include(x => x.Run).ThenInclude(r => r!.Target).FirstAsync(x => x.Id == uploadId, ct);
+        var run = u.Run!;
+        if (run.FilePath == null || run.FileGone) throw new InvalidOperationException("The local file is gone");
+        var local = Path.Combine(_paths.Backups, run.FilePath);
+        var folderRel = Path.GetDirectoryName(run.FilePath)!.Replace('\\', '/');
+        try
+        {
+            u.RemoteRef = await _destinations.UploadAsync(u.Destination!, run.Target!, run, local, folderRel, Path.GetFileName(local), ct);
+            u.Status = UploadStatus.Succeeded;
+            u.Error = null;
+            u.Deleted = false;
+        }
+        catch (Exception e)
+        {
+            u.Status = UploadStatus.Failed;
+            u.Error = e.Message;
+        }
+        u.FinishedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(CancellationToken.None);
+        return u;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Restore
+    // ════════════════════════════════════════════════════════════════
+
+    private async Task RunRestoreCoreAsync(long runId, RestoreOptions options, CancellationToken cancel)
+    {
+        using var scope = _scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var run = await db.Runs.FirstAsync(r => r.Id == runId);
+        var source = await db.Runs.AsNoTracking().FirstAsync(r => r.Id == run.SourceRunId);
+        var target = await db.Targets.AsNoTracking().FirstAsync(t => t.Id == run.TargetId);
+        run.Status = RunStatus.Running;
+        await db.SaveChangesAsync(CancellationToken.None);
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        timeout.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, target.TimeoutMinutes) * 2));
+        var ct = timeout.Token;
+
+        var log = new StringBuilder();
+        var workDir = WorkDir();
+        var scratch = new List<string>();
+        string? containerFile = null;
+        string? containerId = null;
+        RestoreCommand? cmd = null;
+        try
+        {
+            if (RestoreCommandBuilder.UnsupportedReason(target) is { } reason) throw new InvalidOperationException(reason);
+
+            // 1. Get the file — local copy, or download a remote one
+            string sourceFile;
+            var local = source.FilePath == null ? null : Path.Combine(_paths.Backups, source.FilePath);
+            if (options.FromUploadId is { } uploadId)
+            {
+                var upload = await db.Uploads.Include(u => u.Destination).FirstAsync(u => u.Id == uploadId && u.RunId == source.Id, ct);
+                sourceFile = Path.Combine(workDir, $"restore-{runId}-download{Path.GetExtension(source.FilePath)}");
+                scratch.Add(sourceFile);
+                log.AppendLine($"downloading from {upload.Destination!.Name}");
+                await _destinations.DownloadAsync(upload.Destination, upload.RemoteRef!, sourceFile, ct);
+            }
+            else if (local != null && File.Exists(local) && !source.FileGone) sourceFile = local;
+            else throw new InvalidOperationException("The backup file is no longer on disk — pick a remote copy");
+
+            // 2. Decrypt + decompress into a plain file
+            var plain = Path.Combine(workDir, $"restore-{runId}.plain");
+            scratch.Add(plain);
+            await PreparePlainAsync(db, source, sourceFile, plain, options, workDir, scratch, log, ct);
+            log.AppendLine($"prepared {Notifier.FormatSize(new FileInfo(plain).Length)} of dump data");
+
+            // 3. Load it
+            var (creds, cid) = await ResolveAsync(target, log, ct);
+            containerId = cid;
+            if (target.Mode == ExecutionMode.DockerExec)
+            {
+                var name = $"acopy-restore-{runId}";
+                await _docker.PutFileAsync(containerId!, plain, "/tmp", name, ct);
+                containerFile = $"/tmp/{name}";
+                cmd = RestoreCommandBuilder.Build(target, creds, containerFile, workDir);
+                var stderr = new StringBuilder();
+                using var stdout = new MemoryStream();
+                var code = await _docker.ExecAsync(containerId!, cmd.Argv, cmd.Env, stdout, stderr, ct);
+                AppendOutput(log, stdout, stderr);
+                if (code != 0) throw new InvalidOperationException($"restore exited with code {code}: {LastLine(stderr)}");
+            }
+            else
+            {
+                cmd = RestoreCommandBuilder.Build(target, creds, plain, workDir);
+                if (cmd.SqliteTargetPath != null) await SqliteRestoreAsync(plain, cmd.SqliteTargetPath, ct);
+                else await RunRestoreProcessAsync(cmd, log, ct);
+            }
+
+            run.Status = RunStatus.Succeeded;
+            log.AppendLine($"restored {source.FilePath} (run #{source.Id})");
+        }
+        catch (Exception e)
+        {
+            run.Status = cancel.IsCancellationRequested ? RunStatus.Cancelled : RunStatus.Failed;
+            run.Error = cancel.IsCancellationRequested ? "Cancelled" : e is OperationCanceledException ? "Timed out" : e.Message;
+            if (e is not InvalidOperationException and not OperationCanceledException) _log.LogWarning(e, "Restore of {Target} failed", target.Name);
+        }
+        finally
+        {
+            foreach (var f in scratch) TryDelete(f);
+            if (cmd != null) foreach (var f in cmd.TempFiles.Keys) TryDelete(f);
+            if (containerFile != null && containerId != null)
+            {
+                try { await _docker.ExecAsync(containerId, ["rm", "-f", containerFile], new Dictionary<string, string>(), Stream.Null, new StringBuilder(), CancellationToken.None); }
+                catch { /* best effort */ }
+            }
+        }
+
+        run.FinishedAt = DateTimeOffset.UtcNow;
+        run.Log = Truncate(log.ToString());
+        await db.SaveChangesAsync(CancellationToken.None);
+        await _notifier.NotifyAsync(target, run);
+    }
+
+    private async Task PreparePlainAsync(
+        AppDbContext db, BackupRun source, string sourceFile, string plain, RestoreOptions options,
+        string workDir, List<string> scratch, StringBuilder log, CancellationToken ct)
+    {
+        var name = source.FilePath ?? sourceFile;
+        var current = sourceFile;
+        var key = source.EncryptionKeyId == null ? null : await db.Keys.AsNoTracking().FirstOrDefaultAsync(k => k.Id == source.EncryptionKeyId, ct);
+
+        Stream OpenDecrypted()
+        {
+            if (name.EndsWith(".enc", StringComparison.Ordinal))
+            {
+                if (key == null) throw new InvalidOperationException("The file is encrypted but its key no longer exists in ACopy");
+                var pass = _secrets.Unprotect(key.SecretProtected) ?? throw new InvalidOperationException($"Key '{key.Name}' has no passphrase");
+                log.AppendLine($"decrypting with key '{key.Name}'");
+                return Encryption.PassphraseDecrypt(File.OpenRead(current), pass);
+            }
+            return File.OpenRead(current);
+        }
+
+        if (name.EndsWith(".age", StringComparison.Ordinal))
+        {
+            var identity = !string.IsNullOrWhiteSpace(options.AgeIdentity) ? options.AgeIdentity
+                : key != null ? _secrets.Unprotect(key.SecretProtected) : null;
+            if (string.IsNullOrWhiteSpace(identity))
+                throw new InvalidOperationException("This file is age-encrypted and ACopy has no private key for it — paste the identity to restore");
+            var decrypted = Path.Combine(workDir, $"{Path.GetFileName(plain)}.dec");
+            scratch.Add(decrypted);
+            log.AppendLine($"decrypting with age{(key != null ? $" (key '{key.Name}')" : "")}");
+            await Encryption.AgeDecryptAsync(identity, current, decrypted, workDir, ct);
+            current = decrypted;
+            name = name[..^4];
+        }
+
+        var plainName = name.EndsWith(".enc", StringComparison.Ordinal) ? name[..^4] : name;
+        await using var input = OpenDecrypted();
+        await using Stream decompressed = plainName.EndsWith(".gz", StringComparison.Ordinal) ? new GZipStream(input, CompressionMode.Decompress)
+            : plainName.EndsWith(".br", StringComparison.Ordinal) ? new BrotliStream(input, CompressionMode.Decompress)
+            : input;
+        await using var output = File.Create(plain);
+        await decompressed.CopyToAsync(output, ct);
+    }
+
+    private static async Task RunRestoreProcessAsync(RestoreCommand cmd, StringBuilder log, CancellationToken ct)
+    {
+        foreach (var (path, content) in cmd.TempFiles)
+        {
+            await File.WriteAllTextAsync(path, content, ct);
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        var psi = new ProcessStartInfo(cmd.Argv[0])
+        {
+            RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = cmd.StdinFile != null, UseShellExecute = false,
+        };
+        foreach (var a in cmd.Argv.Skip(1)) psi.ArgumentList.Add(a);
+        foreach (var (k, v) in cmd.Env) psi.Environment[k] = v;
+        using var proc = new Process { StartInfo = psi };
+        try { proc.Start(); }
+        catch (System.ComponentModel.Win32Exception e) { throw new InvalidOperationException($"Could not start {cmd.Argv[0]}: {e.Message}"); }
+
+        var stdout = proc.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderr = proc.StandardError.ReadToEndAsync(CancellationToken.None);
+        try
+        {
+            if (cmd.StdinFile != null)
+            {
+                await using (var f = File.OpenRead(cmd.StdinFile)) await f.CopyToAsync(proc.StandardInput.BaseStream, ct);
+                proc.StandardInput.Close();
+            }
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { /* gone */ }
+            throw;
+        }
+        var err = await stderr;
+        var o = await stdout;
+        if (o.Length > 0) log.AppendLine(o.Length > 8000 ? o[^8000..] : o);
+        if (err.Length > 0) log.AppendLine(err.Length > 16000 ? err[^16000..] : err);
+        if (proc.ExitCode != 0)
+            throw new InvalidOperationException($"{cmd.Argv[0]} exited with code {proc.ExitCode}: {LastLine(new StringBuilder(err))}");
+    }
+
+    private static async Task SqliteRestoreAsync(string plain, string targetPath, CancellationToken ct)
+    {
+        if (!File.Exists(targetPath)) throw new InvalidOperationException($"SQLite file not found: {targetPath}");
+        await Task.Run(() =>
+        {
+            using var src = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = plain, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+            using var dst = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = targetPath, Pooling = false }.ToString());
+            src.Open();
+            dst.Open();
+            src.BackupDatabase(dst);
+        }, ct);
+    }
+
+    private static void AppendOutput(StringBuilder log, MemoryStream stdout, StringBuilder stderr)
+    {
+        var o = Encoding.UTF8.GetString(stdout.ToArray());
+        if (o.Length > 0) log.AppendLine(o.Length > 8000 ? o[^8000..] : o);
+        if (stderr.Length > 0) log.Append(stderr);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Shared
+    // ════════════════════════════════════════════════════════════════
 
     /// <summary>Credentials: explicit values win; DockerExec fills blanks from the container's environment.</summary>
     public async Task<(Credentials, string?)> ResolveAsync(BackupTarget t, StringBuilder log, CancellationToken ct)
@@ -219,7 +581,7 @@ public class BackupRunner
 
         if (t.Mode == ExecutionMode.DockerExec)
         {
-            if (!_docker.Configured) throw new InvalidOperationException("Docker socket is not available — mount /var/run/docker.sock to use exec mode");
+            if (!_docker.Configured) throw new InvalidOperationException("Docker is not available — mount /var/run/docker.sock or set DOCKER_HOST to use exec mode");
             if (string.IsNullOrWhiteSpace(t.ContainerName)) throw new InvalidOperationException("No container configured");
             var c = await _docker.InspectAsync(t.ContainerName, ct) ?? throw new InvalidOperationException($"Container '{t.ContainerName}' not found");
             if (!c.Running) throw new InvalidOperationException($"Container '{t.ContainerName}' is not running");
@@ -237,14 +599,14 @@ public class BackupRunner
         return (new Credentials(user, password, string.IsNullOrWhiteSpace(t.DatabaseName) ? null : t.DatabaseName.Trim()), containerId);
     }
 
-    private static Stream Compress(Stream file, Compression c) => c switch
+    private static Stream Compress(Stream output, Compression c) => c switch
     {
-        Compression.Gzip => new GZipStream(file, CompressionLevel.Optimal, leaveOpen: true),
-        Compression.Brotli => new BrotliStream(file, CompressionLevel.Optimal, leaveOpen: true),
-        _ => new NonClosingStream(file),
+        Compression.Gzip => new GZipStream(output, CompressionLevel.Optimal, leaveOpen: true),
+        Compression.Brotli => new BrotliStream(output, CompressionLevel.Optimal, leaveOpen: true),
+        _ => new NonClosingStream(output),
     };
 
-    private async Task RunProcessAsync(DumpCommand cmd, Stream output, StringBuilder log, CancellationToken ct)
+    private static async Task RunProcessAsync(DumpCommand cmd, Stream output, StringBuilder log, CancellationToken ct)
     {
         foreach (var (path, content) in cmd.TempFiles)
         {
@@ -300,10 +662,8 @@ public class BackupRunner
         var stderr = new StringBuilder();
         var code = await _docker.ExecAsync(containerId, cmd.Argv, cmd.Env, output, stderr, ct);
         log.Append(stderr);
-        if (code != 0) throw new InvalidOperationException($"{ExecToolName(cmd)} exited with code {code}: {LastLine(stderr)}");
+        if (code != 0) throw new InvalidOperationException($"{(cmd.Argv[0] == "sh" ? "dump" : cmd.Argv[0])} exited with code {code}: {LastLine(stderr)}");
     }
-
-    private static string ExecToolName(DumpCommand cmd) => cmd.Argv[0] == "sh" ? "dump" : cmd.Argv[0];
 
     private static async Task SqliteBackupAsync(string source, string workDir, Stream output, CancellationToken ct)
     {
@@ -343,7 +703,8 @@ public class BackupRunner
     {
         var keep = Math.Max(10, _opt.HistoryPerTarget);
         var cutoff = await db.Runs.Where(r => r.TargetId == targetId).OrderByDescending(r => r.Id).Skip(keep).Select(r => (long?)r.Id).FirstOrDefaultAsync();
-        if (cutoff != null) await db.Runs.Where(r => r.TargetId == targetId && r.Id <= cutoff).ExecuteDeleteAsync();
+        // Never drop the history row of a file that still exists — it is how the UI restores and downloads it
+        if (cutoff != null) await db.Runs.Where(r => r.TargetId == targetId && r.Id <= cutoff && (r.FileGone || r.FilePath == null || r.Kind == RunKind.Restore)).ExecuteDeleteAsync();
     }
 
     private static async Task<string> HashAsync(string path, CancellationToken ct)
@@ -379,7 +740,11 @@ public class BackupRunner
                 .SetProperty(r => r.Status, RunStatus.Failed)
                 .SetProperty(r => r.Error, "Interrupted by an ACopy restart")
                 .SetProperty(r => r.FinishedAt, DateTimeOffset.UtcNow));
+        await db.Uploads.Where(u => u.Status == UploadStatus.Pending)
+            .ExecuteUpdateAsync(s => s.SetProperty(u => u.Status, UploadStatus.Failed).SetProperty(u => u.Error, "Interrupted by an ACopy restart"));
 
+        var work = Path.Combine(Path.GetTempPath(), "acopy");
+        if (Directory.Exists(work)) foreach (var f in Directory.EnumerateFiles(work)) TryDelete(f);
         if (!Directory.Exists(_paths.Backups)) return;
         foreach (var f in Directory.EnumerateFiles(_paths.Backups, BackupFiles.TempPrefix + "*", SearchOption.AllDirectories))
             if (BackupFiles.IsAcopyTemp(Path.GetFileName(f))) TryDelete(f);
@@ -408,7 +773,7 @@ internal sealed class CountingStream(Stream inner) : Stream
     }
 }
 
-/// <summary>Pass-through used for "no compression" so disposing it doesn't close the file early.</summary>
+/// <summary>Pass-through used where disposing must not close the underlying stream.</summary>
 internal sealed class NonClosingStream(Stream inner) : Stream
 {
     public override bool CanRead => false;

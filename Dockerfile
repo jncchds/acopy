@@ -24,6 +24,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine AS runtime
 WORKDIR /app
 
 # Client tools for network-mode backups. pg_dump 18 dumps any older server too.
+# rclone copies backups to destinations (S3, B2, SFTP, WebDAV, …); age encrypts them.
 # mariadb-connector-c brings the caching_sha2_password plugin MySQL 8+ needs.
 # valkey-cli is protocol-compatible with redis-cli (--rdb included); exposed under both names.
 RUN apk add --no-cache \
@@ -33,6 +34,8 @@ RUN apk add --no-cache \
         mongodb-tools \
         valkey-cli \
         sqlite \
+        rclone \
+        age \
         tzdata \
         su-exec \
         curl \

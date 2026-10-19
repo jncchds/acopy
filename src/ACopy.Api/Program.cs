@@ -33,6 +33,9 @@ builder.Services.AddDataProtection().SetApplicationName("ACopy").PersistKeysToDb
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<DockerClient>();
+builder.Services.AddSingleton<Secrets>();
+builder.Services.AddSingleton<ACopy.Api.Destinations.TelegramClient>();
+builder.Services.AddSingleton<ACopy.Api.Destinations.DestinationService>();
 builder.Services.AddSingleton<SettingsStore>();
 builder.Services.AddSingleton<Notifier>();
 builder.Services.AddSingleton<BackupRunner>();
@@ -93,6 +96,7 @@ secured.MapTargetEndpoints();
 secured.MapRunEndpoints();
 secured.MapDockerEndpoints();
 secured.MapSettingsEndpoints();
+secured.MapStorageEndpoints();
 api.MapFallback(() => Results.NotFound());
 
 // SPA: every non-API route serves index.html

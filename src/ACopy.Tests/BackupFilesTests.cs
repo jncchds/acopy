@@ -10,6 +10,9 @@ public class BackupFilesTests
         Name = "My App DB", Folder = "my-app-db", Engine = Engine.PostgreSql, Naming = naming, Keep = keep, Compression = c,
     };
 
+    private static readonly DateTime Now = new(2026, 10, 20, 3, 0, 0, DateTimeKind.Utc);
+    private static IEnumerable<FileEntry> Entries(IEnumerable<string> names) => names.Select(n => new FileEntry(n, Now));
+
     [Theory]
     [InlineData("My App DB", "my-app-db")]
     [InlineData("  Ünïcode / slashes\\ ", "n-code-slashes")]
@@ -50,7 +53,7 @@ public class BackupFilesTests
             "my-app-db-other_20261001-030000.sql.gz",
             "notes.txt",
         };
-        var pruned = BackupFiles.FilesToPrune(Target(NamingMode.Timestamp, 3), files, "my-app-db_20261019-030000.sql.gz");
+        var pruned = BackupFiles.FilesToPrune(Target(NamingMode.Timestamp, 3), Entries(files), "my-app-db_20261019-030000.sql.gz", Now);
         Assert.Equal(["my-app-db_20261016-030000.sql.gz", "my-app-db_20261015-030000.sql.gz"], pruned);
     }
 
@@ -58,7 +61,7 @@ public class BackupFilesTests
     public void Prune_Rolling_RemovesSlotsBeyondKeep_AndStaleExtensions()
     {
         var files = new[] { "my-app-db.0.sql.gz", "my-app-db.1.sql.gz", "my-app-db.1.sql", "my-app-db.2.sql.gz", "my-app-db.5.sql.gz", "other.0.sql.gz" };
-        var pruned = BackupFiles.FilesToPrune(Target(NamingMode.Rolling, 2), files, "my-app-db.1.sql.gz");
+        var pruned = BackupFiles.FilesToPrune(Target(NamingMode.Rolling, 2), Entries(files), "my-app-db.1.sql.gz", Now);
         Assert.Equal(["my-app-db.1.sql", "my-app-db.2.sql.gz", "my-app-db.5.sql.gz"], pruned);
     }
 
