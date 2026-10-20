@@ -208,7 +208,9 @@ public static class StorageEndpoints
             if (backend == null) e["rcloneType"] = ["Pick a backend"];
             else
             {
-                var allowed = backend.Fields.Select(f => f.Key).ToHashSet();
+                // fileNames: ACopy's own option (local | timestamp), never passed to rclone
+                var allowed = backend.Fields.Select(f => f.Key).Append("fileNames").ToHashSet();
+                if (p.TryGetValue("fileNames", out var fn) && fn is not ("local" or "timestamp")) e["params.fileNames"] = ["local or timestamp"];
                 p = p.Where(kv => allowed.Contains(kv.Key)).ToDictionary();
                 stored = stored.Where(kv => backend.Fields.Any(f => f.Secret && f.Key == kv.Key)).ToDictionary();
                 foreach (var f in backend.Fields.Where(f => f.Required))
@@ -238,8 +240,8 @@ public static class StorageEndpoints
         d.ParamsJson = JsonSerializer.Serialize(p);
         d.SecretsProtected = secrets.ProtectMap(stored);
         d.RemotePath = i.Kind == DestinationKind.Rclone ? i.RemotePath?.Trim() : null;
-        d.Keep = i.Keep;
-        d.MaxAgeDays = i.MaxAgeDays;
+        d.Keep = i.Kind == DestinationKind.Rclone ? i.Keep : null; // Telegram has no retention
+        d.MaxAgeDays = i.Kind == DestinationKind.Rclone ? i.MaxAgeDays : null;
         return e;
     }
 

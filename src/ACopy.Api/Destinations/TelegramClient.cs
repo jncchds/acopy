@@ -23,6 +23,31 @@ public class TelegramClient(IHttpClientFactory httpFactory, IOptions<TelegramOpt
     public string ResolveApiUrl(string? configured) =>
         string.IsNullOrWhiteSpace(configured) ? DefaultApiUrl : configured.Trim().TrimEnd('/');
 
+    /// <summary>
+    /// The shared upload folder (ACopy's path, the server's path) when files for <paramref name="apiUrl"/> go by path:
+    /// both folders configured and the URL is the configured self-hosted server.
+    /// </summary>
+    public (string Local, string Server)? StagingFor(string apiUrl)
+    {
+        var o = options.Value;
+        if (string.IsNullOrWhiteSpace(o.UploadDir) || string.IsNullOrWhiteSpace(o.ServerUploadDir)) return null;
+        if (IsPublic(DefaultApiUrl) || !apiUrl.TrimEnd('/').Equals(DefaultApiUrl, StringComparison.OrdinalIgnoreCase)) return null;
+        return (o.UploadDir.Trim(), o.ServerUploadDir.Trim().TrimEnd('/'));
+    }
+
+    /// <summary>On start-up: removes half-written copies (ACopy's <c>.syncthing.acopy-*.tmp</c> files) from the upload folder.</summary>
+    public void CleanStaging(ILogger log)
+    {
+        var dir = options.Value.UploadDir;
+        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return;
+        foreach (var f in Directory.EnumerateFiles(dir, Services.BackupFiles.TempPrefix + "*", SearchOption.AllDirectories))
+        {
+            if (!Services.BackupFiles.IsAcopyTemp(Path.GetFileName(f))) continue;
+            try { File.Delete(f); }
+            catch (Exception e) { log.LogWarning(e, "Could not remove the leftover upload file {File}", f); }
+        }
+    }
+
     /// <summary>The public server limits bot uploads to 50 MB; a self-hosted one (<c>--local</c>) to 2000 MB.</summary>
     public static bool IsPublic(string apiUrl) => apiUrl.TrimEnd('/').Equals(PublicApi, StringComparison.OrdinalIgnoreCase);
 
@@ -65,6 +90,17 @@ public class TelegramClient(IHttpClientFactory httpFactory, IOptions<TelegramOpt
         file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var form = DocumentForm(t, captionHtml);
         form.Add(file, "document", fileName);
+        return await PostDocument(t, form, TimeSpan.FromMinutes(30), ct);
+    }
+
+    /// <summary>
+    /// Self-hosted server (<c>--local</c>): sends a file the server reads from its own disk. The server names the
+    /// document after the file, so <paramref name="serverPath"/> must end in the wanted file name.
+    /// </summary>
+    public async Task<SentDocument> SendDocumentByPathAsync(TelegramTarget t, string serverPath, string? captionHtml, CancellationToken ct)
+    {
+        using var form = DocumentForm(t, captionHtml);
+        form.Add(new StringContent("file://" + serverPath), "document");
         return await PostDocument(t, form, TimeSpan.FromMinutes(30), ct);
     }
 

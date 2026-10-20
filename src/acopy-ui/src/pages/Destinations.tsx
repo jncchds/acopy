@@ -62,7 +62,7 @@ export default function Destinations() {
                 <h3 onClick={() => setEditing(d)}>{d.kind === 'Telegram' ? '✈' : '☁'} {d.name}</h3>
                 <div className="meta-row">
                   <span className={`chip ${d.kind === 'Telegram' ? 'chip-patina' : 'chip-accent'}`}>{d.kind === 'Telegram' ? 'Telegram' : `rclone · ${d.rcloneType}`}</span>
-                  <span className="chip">{d.keep != null || d.maxAgeDays != null
+                  <span className="chip">{d.kind === 'Telegram' ? 'messages kept' : d.keep != null || d.maxAgeDays != null
                     ? `keep ${d.keep ? d.keep : '∞'}${d.maxAgeDays ? ` · ≤ ${d.maxAgeDays} days` : ''}`
                     : 'same retention as local'}</span>
                   <span className="chip">{d.usedBy} database{d.usedBy === 1 ? '' : 's'}</span>
@@ -106,11 +106,16 @@ function DestinationForm({ existing, backends, onDone }: {
   const [busy, setBusy] = useState(false)
   const [test, setTest] = useState<{ ok: boolean; message: string } | null>(null)
   const [defaultApi, setDefaultApi] = useState(PUBLIC_API)
-  useEffect(() => { api.meta().then(m => setDefaultApi(m.telegramApiUrl)).catch(() => {}) }, [])
+  const [stagingConfigured, setStagingConfigured] = useState(false)
+  useEffect(() => {
+    api.meta().then(m => { setDefaultApi(m.telegramApiUrl); setStagingConfigured(m.telegramUploadByPath) }).catch(() => {})
+  }, [])
 
   const backend = backends.find(b => b.type === type)
   const effectiveApi = (params.apiUrl?.trim() || defaultApi).replace(/\/$/, '')
   const selfHosted = effectiveApi !== PUBLIC_API
+  // The shared upload folder belongs to the server set by ACOPY_Telegram__ApiUrl
+  const byPath = stagingConfigured && effectiveApi === defaultApi.replace(/\/$/, '')
   const stored = new Set(existing?.secretKeys ?? [])
 
   const input = (): DestinationInput => ({
@@ -225,6 +230,18 @@ function DestinationForm({ existing, backends, onDone }: {
               <input className="mono" value={remotePath} onChange={e => setRemotePath(e.target.value)} placeholder={backend?.pathHint ?? ''} />
               <span className="hint">Each database uploads into its folder below this path, e.g. <code>{(remotePath || backend?.pathHint || '').replace(/\/$/, '')}/my-db/</code></span>
             </label>
+            <label>
+              File names
+              <select value={params.fileNames ?? 'local'} onChange={e => setP('fileNames', e.target.value)}>
+                <option value="local">Same as local</option>
+                <option value="timestamp">Always timestamped</option>
+              </select>
+              <span className="hint">
+                Timestamped: databases with rolling names (<code>app.0.sql.gz</code>) are copied as
+                {' '}<code>app_20261020-030000.sql.gz</code> — the date of the backup — and kept by count / age there.
+              </span>
+              {err('params.fileNames')}
+            </label>
           </div>
         </>
       ) : (
@@ -233,9 +250,12 @@ function DestinationForm({ existing, backends, onDone }: {
             Create a bot with @BotFather, add it to the chat (or open a private chat with it), and use the chat id
             (e.g. <code>-1001234567890</code> for groups). {selfHosted
               ? <>This destination uses the self-hosted Bot API server at <code>{effectiveApi}</code> — files up to 2 GB
-                  per part.</>
+                  per part{byPath ? <>, handed over through the shared upload folder instead of an HTTP upload (one copy per
+                  database, cleaned up by that database's retention)</> : ''}.</>
               : <>The public Bot API accepts files up to 50 MB — larger backups are split into numbered parts
                   (<code>cat file.* &gt; file</code> to join). A self-hosted Bot API server raises that to 2 GB (see the README).</>}
+            {' '}Files are always named with the date of the backup (<code>app_20261020-030000.sql.gz</code>), also for
+            databases with rolling names. ACopy never deletes sent messages — retention does not apply to Telegram.
           </p>
           <div className="form-grid">
             {secretInput('botToken', 'Bot token', false, '123456:ABC…')}
@@ -260,9 +280,11 @@ function DestinationForm({ existing, backends, onDone }: {
         </>
       )}
 
-      <ToggleField checked={customRetention} onChange={setCustomRetention} label="Own retention"
-                   hint="Off = mirror the database's local retention. On = e.g. keep more copies offsite." />
-      {customRetention && (
+      {kind === 'Rclone' && (
+        <ToggleField checked={customRetention} onChange={setCustomRetention} label="Own retention"
+                     hint="Off = mirror the database's local retention. On = e.g. keep more copies offsite." />
+      )}
+      {kind === 'Rclone' && customRetention && (
         <div className="form-grid" style={{ marginTop: '0.75rem' }}>
           <label>Copies to keep<input type="number" min={0} value={keep} onChange={e => setKeep(e.target.value)} placeholder="0 = unlimited" />{err('keep')}</label>
           <label>Maximum age (days)<input type="number" min={1} value={maxAge} onChange={e => setMaxAge(e.target.value)} placeholder="no limit" />{err('maxAgeDays')}</label>

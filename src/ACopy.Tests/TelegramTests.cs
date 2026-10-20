@@ -1,5 +1,7 @@
 using ACopy.Api.Destinations;
+using ACopy.Api.Data;
 using ACopy.Api.Docker;
+using ACopy.Api.Services;
 
 namespace ACopy.Tests;
 
@@ -50,6 +52,43 @@ public class TelegramTests
     {
         Assert.True(TelegramClient.IsPublic("https://api.telegram.org/"));
         Assert.False(TelegramClient.IsPublic("http://telegram-bot-api:8081"));
+    }
+
+    [Fact]
+    public void Upload_folder_retention_counts_parts_as_one_copy()
+    {
+        var now = new DateTime(2026, 10, 20, 12, 0, 0, DateTimeKind.Utc);
+        FileEntry F(string n, int daysAgo) => new(n, now.AddDays(-daysAgo));
+        var files = new[]
+        {
+            F("db_20261020-030000.sql.gz.001", 0), F("db_20261020-030000.sql.gz.002", 0),
+            F("db_20261019-030000.sql.gz.001", 1), F("db_20261019-030000.sql.gz.002", 1), F("db_20261019-030000.sql.gz.003", 1),
+            F("db_20261018-030000.sql.gz", 2),
+            F("other_20261001-030000.sql.gz", 19), F(".syncthing.acopy-db_20261020-030000.sql.gz.003.tmp", 0),
+        };
+        var prune = BackupFiles.PartedFilesToPrune("db", NamingMode.Timestamp, new RetentionPolicy(2, null), files, "db_20261020-030000.sql.gz", now);
+        Assert.Equal(["db_20261018-030000.sql.gz"], prune);
+
+        prune = BackupFiles.PartedFilesToPrune("db", NamingMode.Timestamp, new RetentionPolicy(1, null), files, "db_20261020-030000.sql.gz", now);
+        Assert.Equal(["db_20261019-030000.sql.gz.001", "db_20261019-030000.sql.gz.002", "db_20261019-030000.sql.gz.003", "db_20261018-030000.sql.gz"], prune);
+    }
+
+    [Fact]
+    public void Rolling_names_get_the_backup_date_for_remote_copies()
+    {
+        var rolling = new BackupTarget { Name = "App DB", Folder = "app-db", Naming = NamingMode.Rolling };
+        var stamped = new BackupTarget { Name = "App DB", Folder = "app-db", Naming = NamingMode.Timestamp };
+        var at = new DateTime(2026, 10, 20, 3, 0, 5);
+        Assert.Equal("app-db_20261020-030005.sql.gz.age", BackupFiles.TimestampedName(rolling, "app-db.4.sql.gz.age", at));
+        Assert.Equal("app-db_20261019-030000.sql.gz", BackupFiles.TimestampedName(stamped, "app-db_20261019-030000.sql.gz", at));
+        Assert.Equal("unrelated.bin", BackupFiles.TimestampedName(rolling, "unrelated.bin", at));
+    }
+
+    [Fact]
+    public void File_and_parts_are_found_by_name()
+    {
+        Assert.Equal(["db.0.sql.gz", "db.0.sql.gz.001", "db.0.sql.gz.012"],
+            BackupFiles.FileAndParts("db.0.sql.gz", ["db.0.sql.gz", "db.0.sql.gz.001", "db.0.sql.gz.012", "db.1.sql.gz", "db.0.sql.gz.1", "db.0.sql.gz.0001"]));
     }
 
     [Fact]

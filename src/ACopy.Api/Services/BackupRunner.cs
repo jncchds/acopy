@@ -336,7 +336,7 @@ public class BackupRunner
 
             if (upload.Status == UploadStatus.Succeeded)
             {
-                try { await _destinations.PruneAsync(d, target, folderRel, fileName, db, log, ct); }
+                try { await _destinations.PruneAsync(d, target, run, folderRel, fileName, db, log, ct); }
                 catch (Exception e) { log.AppendLine($"{d.Name}: retention failed: {e.Message}"); }
             }
         }

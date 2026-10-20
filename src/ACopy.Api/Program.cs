@@ -80,6 +80,10 @@ var settingsStore = app.Services.GetRequiredService<SettingsStore>();
 if (!string.IsNullOrEmpty(authOptions.Password))
     await settingsStore.SetAsync(SettingsStore.KeyPasswordHash, SettingsStore.HashPassword(authOptions.Password));
 await app.Services.GetRequiredService<BackupRunner>().RecoverAsync();
+var telegramOptions = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<TelegramOptions>>().Value;
+if (string.IsNullOrWhiteSpace(telegramOptions.UploadDir) != string.IsNullOrWhiteSpace(telegramOptions.ServerUploadDir))
+    app.Logger.LogWarning("Set both ACOPY_Telegram__UploadDir and ACOPY_Telegram__ServerUploadDir to send Telegram files by path; uploading over HTTP");
+app.Services.GetRequiredService<ACopy.Api.Destinations.TelegramClient>().CleanStaging(app.Logger);
 if (authOptions.Disabled) app.Logger.LogWarning("Authentication is DISABLED (ACOPY_Auth__Disabled=true)");
 
 app.UseDefaultFiles();

@@ -44,6 +44,18 @@ public static partial class BackupFiles
         _ => $"{BaseName(t)}_{localNow.ToString(TimestampFormat, CultureInfo.InvariantCulture)}.{EngineCatalog.FileExtension(t, encryption)}",
     };
 
+    /// <summary>
+    /// The timestamped name of a backup, for copies that must carry the date: a rolling slot name
+    /// (<c>app.0.sql.gz</c>) becomes <c>app_20261020-030000.sql.gz</c> with <paramref name="localTime"/>; a timestamped
+    /// name is returned as it is.
+    /// </summary>
+    public static string TimestampedName(BackupTarget t, string fileName, DateTime localTime)
+    {
+        if (t.Naming == NamingMode.Timestamp) return fileName;
+        var m = Regex.Match(fileName, $@"^{Regex.Escape(BaseName(t))}\.\d+\.(.+)$");
+        return m.Success ? $"{BaseName(t)}_{localTime.ToString(TimestampFormat, CultureInfo.InvariantCulture)}.{m.Groups[1].Value}" : fileName;
+    }
+
     public static string TempName(string finalFileName) => $"{TempPrefix}{finalFileName}{TempSuffix}";
 
     /// <summary>Relative folder must stay inside the backups root.</summary>
@@ -123,6 +135,25 @@ public static partial class BackupFiles
             : new Regex($@"^{baseName}\.\d+\..+$");
         return fileNamesInFolder.Where(n => rx.IsMatch(n)).ToList();
     }
+
+    private static readonly Regex PartSuffix = new(@"^(.+)\.(\d{3})$");
+
+    /// <summary>
+    /// Retention for a folder of uploaded copies where big files are split into parts (<c>file.001</c>, <c>file.002</c>…):
+    /// the parts of one backup count as one copy and are deleted together. Same rules as <see cref="FilesToPrune(string, NamingMode, RetentionPolicy, IEnumerable{FileEntry}, string?, DateTime)"/>.
+    /// </summary>
+    public static List<string> PartedFilesToPrune(
+        string baseName, NamingMode naming, RetentionPolicy policy, IEnumerable<FileEntry> files, string? justWritten, DateTime nowUtc)
+    {
+        var groups = files.GroupBy(f => PartSuffix.Match(f.Name) is { Success: true } m ? m.Groups[1].Value : f.Name).ToList();
+        var logical = groups.Select(g => new FileEntry(g.Key, g.Max(f => f.ModifiedUtc)));
+        var prune = FilesToPrune(baseName, naming, policy, logical, justWritten, nowUtc).ToHashSet();
+        return groups.Where(g => prune.Contains(g.Key)).SelectMany(g => g.Select(f => f.Name)).ToList();
+    }
+
+    /// <summary>The file itself and its parts (<c>name.001</c>…) among <paramref name="fileNamesInFolder"/>.</summary>
+    public static List<string> FileAndParts(string fileName, IEnumerable<string> fileNamesInFolder) =>
+        fileNamesInFolder.Where(n => n == fileName || (PartSuffix.Match(n) is { Success: true } m && m.Groups[1].Value == fileName)).ToList();
 
     public static bool IsAcopyTemp(string fileName) =>
         fileName.StartsWith(TempPrefix, StringComparison.Ordinal) && fileName.EndsWith(TempSuffix, StringComparison.Ordinal);

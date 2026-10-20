@@ -63,6 +63,7 @@ public static class MiscEndpoints
         {
             // Used when a Telegram destination or the notification settings leave the Bot API URL blank
             telegramApiUrl = telegram.DefaultApiUrl,
+            telegramUploadByPath = telegram.StagingFor(telegram.DefaultApiUrl) != null,
             version = AppVersion.Value,
             engines = EngineCatalog.All.Select(e => new
             {

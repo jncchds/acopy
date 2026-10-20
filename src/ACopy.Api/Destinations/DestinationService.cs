@@ -10,7 +10,7 @@ namespace ACopy.Api.Destinations;
 public record DestinationTestResult(bool Ok, string Message);
 
 /// <summary>Copies finished backups to destinations (rclone backends, Telegram) and applies remote retention.</summary>
-public class DestinationService(Secrets secrets, TelegramClient telegram)
+public class DestinationService(Secrets secrets, TelegramClient telegram, SettingsStore settings)
 {
     private const string RemoteName = "ACOPY";
 
@@ -22,9 +22,10 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
     public async Task<string> UploadAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string folderRel, string fileName,
         CancellationToken ct, string? previousRef = null)
     {
-        if (d.Kind == DestinationKind.Telegram) return await UploadTelegramAsync(d, t, run, localPath, fileName, previousRef, ct);
+        var (remoteName, _) = await RemoteNameAsync(d, t, run, fileName);
+        if (d.Kind == DestinationKind.Telegram) return await UploadTelegramAsync(d, t, run, localPath, folderRel, remoteName, previousRef, ct);
 
-        var remote = Join(Join(RemoteBase(d), folderRel), fileName);
+        var remote = Join(Join(RemoteBase(d), folderRel), remoteName);
         var env = await RcloneEnvAsync(d, ct);
         var (code, _, err) = await RunRcloneAsync(["copyto", localPath, remote, "--retries", "3", "--low-level-retries", "10"], env, ct);
         if (code != 0) throw new InvalidOperationException($"rclone copyto failed: {LastLine(err)}");
@@ -34,8 +35,10 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
     /// <summary>
     /// Sends the file (split into parts above the size limit) to every chat of the job. Each part is uploaded once and
     /// sent to the other chats by its file id. A chat that fails is reported; the others keep their copy.
+    /// With a shared upload folder the parts are copied there (kept until retention removes them) and sent by path.
     /// </summary>
-    private async Task<string> UploadTelegramAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string fileName, string? previousRef, CancellationToken ct)
+    private async Task<string> UploadTelegramAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string folderRel, string fileName,
+        string? previousRef, CancellationToken ct)
     {
         var (bot, chats) = TelegramOf(d, t);
         var p = Params(d);
@@ -51,6 +54,17 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         var size = new FileInfo(localPath).Length;
         var parts = (int)Math.Max(1, (size + partBytes - 1) / partBytes);
         await using var file = File.OpenRead(localPath);
+
+        var staging = StagingOf(bot.ApiUrl, folderRel);
+        if (staging is { } st && pending.Count > 0)
+        {
+            Directory.CreateDirectory(st.LocalDir);
+            // An earlier copy under this name (a rolling slot) may have had more parts than now
+            var names = Enumerable.Range(1, parts).Select(n => parts == 1 ? fileName : $"{fileName}.{n:000}").ToHashSet();
+            foreach (var old in BackupFiles.FileAndParts(fileName, Directory.EnumerateFiles(st.LocalDir).Select(Path.GetFileName).OfType<string>()))
+                if (!names.Contains(old)) File.Delete(Path.Combine(st.LocalDir, old));
+        }
+
         for (var i = 0; i < parts && pending.Count > failed.Count; i++)
         {
             var offset = i * partBytes;
@@ -63,12 +77,34 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
             if (i == 0 && run.Sha256 != null) caption.Append($"\nsha256 <code>{run.Sha256}</code>");
 
             string? fileId = null;
+            var staged = false;
             foreach (var chat in pending.Where(c => !failed.ContainsKey(c)))
             {
                 try
                 {
                     SentDocument msg;
                     if (fileId != null) msg = await telegram.SendDocumentByIdAsync(bot.ForChat(chat), fileId, caption.ToString(), ct);
+                    else if (staging is { } sh)
+                    {
+                        // One copy per database: another destination may already have written this part in this run
+                        var target = new FileInfo(Path.Combine(sh.LocalDir, name));
+                        if (!staged && !(target.Exists && target.Length == len && target.LastWriteTimeUtc >= run.StartedAt.UtcDateTime))
+                        {
+                            // Written under a temp name and renamed, so the folder only ever holds complete copies
+                            var tmp = Path.Combine(sh.LocalDir, BackupFiles.TempName(name));
+                            await using (var part = new SubStream(file, offset, len))
+                            await using (var copy = File.Create(tmp))
+                                await part.CopyToAsync(copy, ct);
+                            File.Move(tmp, target.FullName, overwrite: true);
+                        }
+                        staged = true;
+                        try { msg = await telegram.SendDocumentByPathAsync(bot.ForChat(chat), $"{sh.ServerDir}/{name}", caption.ToString(), ct); }
+                        catch (InvalidOperationException e) when (e.Message.Contains("file", StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new InvalidOperationException($"{e.Message} — is {sh.LocalDir} the same folder as {sh.ServerDir} in the Bot API server?");
+                        }
+                        fileId = msg.FileId;
+                    }
                     else
                     {
                         await using var part = new SubStream(file, offset, len);
@@ -80,7 +116,7 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
                     failed[chat] = e.Message;
-                    // An incomplete set of parts is useless — take back what this chat already got
+                    // An incomplete set of parts is useless — take back what this chat already got of this upload
                     foreach (var id in sent[chat])
                         try { await telegram.DeleteMessageAsync(bot.ForChat(chat), id, ct); } catch (Exception) { /* best effort */ }
                     sent[chat].Clear();
@@ -96,19 +132,42 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         throw new PartialUploadException(remoteRef, $"sent to {done.Count} of {done.Count + failed.Count} chats — {error}");
     }
 
+    /// <summary>
+    /// A database's folder in the shared upload folder (ACopy's path, the Bot API server's path) when files for this
+    /// server go by path: <c>&lt;upload folder&gt;/&lt;database folder&gt;</c> — one copy for every chat and destination.
+    /// </summary>
+    private (string LocalDir, string ServerDir)? StagingOf(string apiUrl, string folderRel) =>
+        telegram.StagingFor(apiUrl) is { } s ? (Path.Combine(s.Local, folderRel), $"{s.Server}/{folderRel}") : null;
+
     /// <summary>The chat of an upload recorded before multi-chat support (the reference then held message ids only).</summary>
     private string? LegacyChat(Destination d) => TelegramClient.ParseChats(Params(d).GetValueOrDefault("chatId")).FirstOrDefault();
 
+    /// <summary>
+    /// The name of a backup at a destination, and the naming its copies there follow. Telegram always gets the
+    /// timestamped name (the date of the backup); rclone destinations keep the local name unless set to
+    /// <c>fileNames=timestamp</c>.
+    /// </summary>
+    public async Task<(string Name, NamingMode Naming)> RemoteNameAsync(Destination d, BackupTarget t, BackupRun run, string localName)
+    {
+        var timestamped = d.Kind == DestinationKind.Telegram || Params(d).GetValueOrDefault("fileNames") == "timestamp";
+        if (!timestamped || t.Naming == NamingMode.Timestamp) return (localName, t.Naming);
+        var localTime = TimeZoneInfo.ConvertTime(run.StartedAt, await settings.GetTimeZoneAsync()).DateTime;
+        return (BackupFiles.TimestampedName(t, localName, localTime), NamingMode.Timestamp);
+    }
+
     // ── Remote retention ──
 
-    public async Task PruneAsync(Destination d, BackupTarget t, string folderRel, string justWritten, AppDbContext db, StringBuilder runLog, CancellationToken ct)
+    public async Task PruneAsync(Destination d, BackupTarget t, BackupRun run, string folderRel, string localName, AppDbContext db, StringBuilder runLog, CancellationToken ct)
     {
-        var policy = new RetentionPolicy(d.Keep ?? t.Keep, d.Keep != null || d.MaxAgeDays != null ? d.MaxAgeDays : t.MaxAgeDays);
+        var (justWritten, naming) = await RemoteNameAsync(d, t, run, localName);
+        // Telegram messages are never deleted: once sent, a backup stays in the chats until someone removes it there.
+        // The copies in the shared upload folder follow the database's own retention.
         if (d.Kind == DestinationKind.Telegram)
         {
-            await PruneTelegramAsync(d, t, policy, db, runLog, ct);
+            if (StagingOf(TelegramOf(d, t).Bot.ApiUrl, folderRel) is { } st) PruneStaging(t, naming, st.LocalDir, justWritten, runLog);
             return;
         }
+        var policy = new RetentionPolicy(d.Keep ?? t.Keep, d.Keep != null || d.MaxAgeDays != null ? d.MaxAgeDays : t.MaxAgeDays);
 
         var dir = Join(RemoteBase(d), folderRel);
         var env = await RcloneEnvAsync(d, ct);
@@ -116,7 +175,7 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         if (code != 0) { runLog.AppendLine($"{d.Name}: listing for retention failed: {LastLine(err)}"); return; }
         var entries = JsonSerializer.Deserialize<List<LsEntry>>(stdout, new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? [];
         var files = entries.Select(e => new FileEntry(e.Name, e.ModTime.UtcDateTime));
-        var prune = BackupFiles.FilesToPrune(BackupFiles.BaseName(t), t.Naming, policy, files, justWritten, DateTime.UtcNow);
+        var prune = BackupFiles.FilesToPrune(BackupFiles.BaseName(t), naming, policy, files, justWritten, DateTime.UtcNow);
         foreach (var name in prune)
         {
             var path = Join(dir, name);
@@ -131,33 +190,16 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         }
     }
 
-    private async Task PruneTelegramAsync(Destination d, BackupTarget t, RetentionPolicy policy, AppDbContext db, StringBuilder runLog, CancellationToken ct)
+    /// <summary>Deletes copies beyond the database's retention from its upload folder — only names it produces; parts go together.</summary>
+    private static void PruneStaging(BackupTarget t, NamingMode naming, string dir, string justWritten, StringBuilder runLog)
     {
-        // Partly failed uploads (some chats got the file) count too — their messages must be cleaned up as well
-        var uploads = await db.Uploads.Include(u => u.Run)
-            .Where(u => u.DestinationId == d.Id && !u.Deleted && u.Run!.TargetId == t.Id &&
-                        (u.Status == UploadStatus.Succeeded || (u.Status == UploadStatus.Failed && u.RemoteRef != null)))
-            .ToListAsync(ct);
-        var ordered = uploads.OrderByDescending(u => u.Run!.StartedAt).ToList();
-        var keep = t.Naming == NamingMode.Rolling ? Math.Max(1, policy.Keep) : policy.Keep;
-        var (bot, _) = TelegramOf(d, null, requireChat: false);
-        var legacyChat = LegacyChat(d);
-        for (var i = 1; i < ordered.Count; i++)
+        var prune = BackupFiles.PartedFilesToPrune(BackupFiles.BaseName(t), naming, new RetentionPolicy(Math.Max(1, t.Keep), t.MaxAgeDays),
+            BackupFiles.ListFolder(dir), justWritten, DateTime.UtcNow);
+        foreach (var name in prune)
         {
-            var u = ordered[i];
-            var beyond = keep > 0 && i >= keep;
-            var old = policy.MaxAgeDays is > 0 && DateTimeOffset.UtcNow - u.Run!.StartedAt > TimeSpan.FromDays(policy.MaxAgeDays.Value);
-            if (!beyond && !old) continue;
-            foreach (var (chat, ids) in TelegramRef.Parse(u.RemoteRef, legacyChat))
-            foreach (var id in ids)
-            {
-                try { await telegram.DeleteMessageAsync(bot.ForChat(chat), id, ct); }
-                catch (Exception e) { runLog.AppendLine($"{d.Name}: could not delete message {id} in chat {chat}: {e.Message}"); }
-            }
-            u.Deleted = true;
-            runLog.AppendLine($"{d.Name}: retention removed the upload of run #{u.RunId}");
+            try { File.Delete(Path.Combine(dir, name)); runLog.AppendLine($"upload folder: retention deleted {name}"); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { runLog.AppendLine($"upload folder: could not delete {name}: {e.Message}"); }
         }
-        await db.SaveChangesAsync(ct);
     }
 
     // ── Download (restore from a remote copy) ──

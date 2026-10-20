@@ -12,18 +12,24 @@ services:
       # ACOPY_Auth__Password: change-me   # otherwise chosen on first visit
       # PUID: "1000"
       # PGID: "1000"
-      # With the telegram-bot-api service below: every Telegram URL left blank in the UI uses it
+      # With the telegram-bot-api service below: every Telegram URL left blank in the UI uses it,
+      # and files are handed over through a shared upload folder instead of an HTTP upload
       # ACOPY_Telegram__ApiUrl: http://telegram-bot-api:8081
+      # ACOPY_Telegram__UploadDir: /telegram-uploads
+      # ACOPY_Telegram__ServerUploadDir: /var/lib/telegram-bot-api/acopy-uploads
     volumes:
       - ./data:/data
       - ./backups:/backups
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Only the upload subfolder of the bot server's data folder — not its session files
+      # - ./telegram-bot-api/acopy-uploads:/telegram-uploads
     restart: unless-stopped
 
   # Optional self-hosted Telegram Bot API server: files up to 2 GB per message instead of 50 MB.
   #   1. Get an api_id and api_hash at https://my.telegram.org → "API development tools"
   #      and put them in .env next to this file (TELEGRAM_API_ID=…, TELEGRAM_API_HASH=…)
-  #   2. Uncomment ACOPY_Telegram__ApiUrl above, then: docker compose --profile telegram up -d --build
+  #   2. Uncomment the ACOPY_Telegram__* lines and the upload folder mount above, then:
+  #      docker compose --profile telegram up -d --build
   #   3. In ACopy → Destinations → your Telegram destination: "Log out from public API" (once per bot)
   telegram-bot-api:
     image: aiogram/telegram-bot-api:10.2

@@ -189,6 +189,8 @@ export interface Meta {
   labelKeys: { key: string; description: string }[]
   /** Bot API server used when a Telegram URL is left blank (ACOPY_Telegram__ApiUrl, else api.telegram.org). */
   telegramApiUrl: string
+  /** Files for that server go through the shared upload folder (ACOPY_Telegram__UploadDir / ServerUploadDir). */
+  telegramUploadByPath: boolean
 }
 
 export interface Dashboard {

@@ -1,7 +1,10 @@
 // A tiny stand-in for the Telegram Bot API: accepts getMe / sendMessage / sendDocument / deleteMessage / logOut
-// and records every call (with its chat, and whether a document was uploaded or re-sent by file id).
+// and records every call (with its chat, and whether a document was uploaded, sent by local path — read from the
+// shared upload folder like a --local server — or re-sent by file id).
 // GET /log returns the record (used by e2e.mjs). Chat 403 behaves like a user who blocked the bot.
+import fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 
 const calls = []
 let nextId = 1000
@@ -27,15 +30,24 @@ http.createServer((req, res) => {
     const head = Buffer.concat(chunks).toString('latin1')
     const form = (req.headers['content-type'] ?? '').includes('urlencoded') ? new URLSearchParams(head) : null
     const get = name => form ? form.get(name) : field(head, name)
-    const fileName = head.match(/filename="?([^";\r\n]+)"?/)?.[1] ?? null
+    let fileName = head.match(/filename="?([^";\r\n]+)"?/)?.[1] ?? null
     const call = { method, token, size, fileName, chatId: get('chat_id'), at: new Date().toISOString() }
-    if (method === 'sendDocument' && !fileName) call.fileIdSent = get('document')
+    if (method === 'sendDocument' && !fileName) {
+      const doc = get('document') ?? ''
+      if (doc.startsWith('file://')) {
+        // --local mode: the server reads the file from its own disk (the shared upload folder)
+        call.localPath = doc.slice('file://'.length)
+        call.fileName = fileName = path.basename(call.localPath)
+        call.fileSize = fs.existsSync(call.localPath) ? fs.statSync(call.localPath).size : null
+      } else call.fileIdSent = doc
+    }
     if (method === 'deleteMessage') call.messageId = Number(get('message_id'))
     calls.push(call)
     const ok = (result) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, result })) }
     const fail = (code, description) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error_code: code, description })) }
     if (token !== '123:e2e') return fail(401, 'Unauthorized')
     if (call.chatId === '403') return fail(403, 'Forbidden: bot was blocked by the user')
+    if (call.localPath && call.fileSize == null) return fail(400, 'Bad Request: file not found')
     switch (method) {
       case 'getMe': return ok({ id: 1, is_bot: true, username: 'acopy_e2e_bot' })
       case 'logOut': return ok(true)
