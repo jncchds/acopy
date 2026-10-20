@@ -1,26 +1,40 @@
 # Release notes
 
-## Unreleased
+## v0.2.0 — 2026-10-20
+
+Telegram grows up: per-database recipients, a self-hosted Bot API server for files up to 2 GB, and backups that
+stay in the chat for good.
 
 ### Telegram
-- **Chats per database:** a database (or the `acopy.telegram_chats` label, also per job) can name its own
-  comma-separated Telegram chats, replacing the destination's chat — send each backup to the people
-  responsible for it. Destination and notification chat ids also accept several chats.
-- Each part is uploaded once and sent to further chats by file id. When some chats refuse a file, the upload
-  is marked failed with the reason, the other chats keep their copy, and **Retry** only sends to the missing
-  ones.
-- Files sent to Telegram are always named with the date of the backup, also for rolling databases.
-- **Retention no longer deletes Telegram messages**; Telegram destinations have no retention setting.
-- **Self-hosted Bot API server:** an optional `telegram-bot-api` service in `docker-compose.yml`
-  (`--profile telegram`), `ACOPY_Telegram__ApiUrl` as the default server for every Telegram URL left blank,
-  and a **Log out from public API** button to move a bot over. Files up to 2 GB per part.
-- **Shared upload folder** (`ACOPY_Telegram__UploadDir` / `ACOPY_Telegram__ServerUploadDir`): files for the
-  self-hosted server are written to a subfolder of its data folder and sent by path instead of over HTTP —
-  one copy per database, cleaned up by the database's retention. `/backups` stays private to ACopy.
+- **Chats per database.** A database can name its own Telegram chats (*Telegram chats* in the editor, or the
+  `acopy.telegram_chats` label — also per job), replacing the destination's chat: each backup goes to the people
+  responsible for it. Chat ids are comma-separated lists everywhere — destinations and notifications too.
+- **One upload, many chats.** Each part is uploaded once and sent to the other chats by Telegram's file id. If
+  some chats refuse a file (e.g. a user blocked the bot), the upload is marked failed with the reason, the other
+  chats keep their copy, and **Retry** only sends to the chats still missing it.
+- **Dated file names.** Files sent to Telegram always carry the date of the backup — rolling databases too
+  (`app.0.sql.gz` arrives as `app_20261020-030000.sql.gz`).
+- **Messages are kept.** Retention no longer deletes Telegram messages; Telegram destinations have no
+  retention setting any more.
+- **Self-hosted Bot API server** ([telegram-bot-api](https://github.com/tdlib/telegram-bot-api)): up to 2 GB per
+  part instead of 50 MB.
+  - Optional `telegram-bot-api` service in `docker-compose.yml` (`docker compose --profile telegram up -d`).
+  - `ACOPY_Telegram__ApiUrl` — the default server for every Telegram URL left blank in the UI.
+  - **Log out from public API** in the destination form — the one-time step to move a bot over.
+  - **Shared upload folder** (`ACOPY_Telegram__UploadDir` / `ACOPY_Telegram__ServerUploadDir`): files are
+    written to a subfolder of the server's data folder and sent by path instead of over HTTP. One copy per
+    database for all chats and destinations, cleaned up by the database's retention; `/backups` is never
+    shared with the server.
 
 ### Destinations
-- rclone destinations: **File names → always timestamped** copies rolling databases under dated names
-  (`app_20261020-030000.sql.gz`), with remote retention by count / age.
+- rclone destinations: **File names → Always timestamped** stores rolling databases under dated names, kept by
+  count / age on the remote. The default stays *Same as local*.
+
+### Upgrading from 0.1.0
+- The database is migrated on start (one new column).
+- Old Telegram messages are no longer pruned; delete them in the chat if you need to. Retention values set on a
+  Telegram destination are ignored.
+- Rolling databases now reach Telegram under dated names, so new messages no longer reuse the slot names.
 
 ## v0.1.0 — 2026-10-19
 
