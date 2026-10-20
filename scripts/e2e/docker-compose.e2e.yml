@@ -12,6 +12,8 @@ services:
     environment:
       ACOPY_Auth__Password: e2e-password
       ACOPY_Docker__ScanSeconds: "10"
+      # Default Bot API server for every Telegram URL left blank (the way a self-hosted server is wired in)
+      ACOPY_Telegram__ApiUrl: http://mock-telegram:8081
       TZ: Europe/Berlin
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -31,6 +33,9 @@ services:
       acopy.jobs.all.schedule: "*/2 * * * *"
       acopy.jobs.all.keep: "3"
       acopy.jobs.all.naming: "rolling"
+      # The cluster dump goes to two people instead of the destination's chat
+      acopy.jobs.all.destinations: "tg"
+      acopy.jobs.all.telegram_chats: "100, 200"
 
   mariadb:
     image: mariadb:11

@@ -328,6 +328,7 @@ public class BackupRunner
             {
                 upload.Status = UploadStatus.Failed;
                 upload.Error = e is OperationCanceledException ? "Timed out" : e.Message;
+                if (e is PartialUploadException partial) upload.RemoteRef = partial.RemoteRef;
                 log.AppendLine($"{d.Name}: upload failed: {upload.Error}");
             }
             upload.FinishedAt = DateTimeOffset.UtcNow;
@@ -353,7 +354,9 @@ public class BackupRunner
         var folderRel = Path.GetDirectoryName(run.FilePath)!.Replace('\\', '/');
         try
         {
-            u.RemoteRef = await _destinations.UploadAsync(u.Destination!, run.Target!, run, local, folderRel, Path.GetFileName(local), ct);
+            // A partly sent Telegram upload only goes to the chats that are still missing it
+            var previous = u.Deleted ? null : u.RemoteRef;
+            u.RemoteRef = await _destinations.UploadAsync(u.Destination!, run.Target!, run, local, folderRel, Path.GetFileName(local), ct, previous);
             u.Status = UploadStatus.Succeeded;
             u.Error = null;
             u.Deleted = false;
@@ -362,6 +365,7 @@ public class BackupRunner
         {
             u.Status = UploadStatus.Failed;
             u.Error = e.Message;
+            if (e is PartialUploadException partial) { u.RemoteRef = partial.RemoteRef; u.Deleted = false; }
         }
         u.FinishedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(CancellationToken.None);

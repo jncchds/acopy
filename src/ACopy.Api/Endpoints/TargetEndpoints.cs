@@ -1,5 +1,6 @@
 using System.Text;
 using ACopy.Api.Data;
+using ACopy.Api.Destinations;
 using ACopy.Api.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -137,6 +138,7 @@ public static class TargetEndpoints
         t.MaxAgeDays = t.Naming == NamingMode.Timestamp ? i.MaxAgeDays : null;
         t.EncryptionKeyId = i.EncryptionKeyId;
         t.RestoreCommand = Blank(i.RestoreCommand);
+        t.TelegramChatIds = NormalizeChats(i.TelegramChatIds);
         var wanted = (i.DestinationIds ?? []).Distinct().ToList();
         t.Destinations.RemoveAll(d => !wanted.Contains(d.DestinationId));
         foreach (var id in wanted.Where(id => t.Destinations.All(d => d.DestinationId != id)))
@@ -151,6 +153,10 @@ public static class TargetEndpoints
     }
 
     private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
+    /// <summary>"1, 2,,3" → "1,2,3"; empty → null.</summary>
+    internal static string? NormalizeChats(string? s) =>
+        TelegramClient.ParseChats(s) is { Count: > 0 } chats ? string.Join(',', chats) : null;
 
     internal static async Task<List<TargetDto>> ToDtos(AppDbContext db, BackupRunner runner, SettingsStore settings, List<BackupTarget> targets)
     {

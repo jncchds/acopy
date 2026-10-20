@@ -58,19 +58,23 @@ public class Notifier(SettingsStore settings, Secrets secrets, TelegramClient te
         if (!string.IsNullOrWhiteSpace(url)) await PostAsync(url, payload);
         if (await TelegramTargetAsync() is { } tg)
         {
-            try { await telegram.SendMessageAsync(tg, html, CancellationToken.None); }
-            catch (Exception e) { log.LogWarning(e, "Telegram notification failed"); }
+            foreach (var chat in tg.Chats)
+            {
+                try { await telegram.SendMessageAsync(tg.Bot.ForChat(chat), html, CancellationToken.None); }
+                catch (Exception e) { log.LogWarning(e, "Telegram notification to chat {Chat} failed", chat); }
+            }
         }
     }
 
-    public async Task<TelegramTarget?> TelegramTargetAsync()
+    /// <summary>The notification bot and its chats (the chat id setting is a comma-separated list).</summary>
+    public async Task<(TelegramTarget Bot, List<string> Chats)?> TelegramTargetAsync()
     {
         var token = secrets.Unprotect(await settings.GetAsync(SettingsStore.KeyTelegramToken));
-        var chat = await settings.GetAsync(SettingsStore.KeyTelegramChat);
-        if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(chat)) return null;
+        var chats = TelegramClient.ParseChats(await settings.GetAsync(SettingsStore.KeyTelegramChat));
+        if (string.IsNullOrWhiteSpace(token) || chats.Count == 0) return null;
         int? thread = int.TryParse(await settings.GetAsync(SettingsStore.KeyTelegramThread), out var t) ? t : null;
-        var api = await settings.GetAsync(SettingsStore.KeyTelegramApi);
-        return new TelegramTarget(token, chat, thread, string.IsNullOrWhiteSpace(api) ? TelegramClient.DefaultApi : api);
+        var api = telegram.ResolveApiUrl(await settings.GetAsync(SettingsStore.KeyTelegramApi));
+        return (new TelegramTarget(token, chats[0], thread, api), chats);
     }
 
     public async Task<string?> SendTestAsync(string url)
@@ -87,8 +91,13 @@ public class Notifier(SettingsStore settings, Secrets secrets, TelegramClient te
     {
         var tg = await TelegramTargetAsync();
         if (tg == null) return "Bot token and chat id are required";
-        try { await telegram.SendMessageAsync(tg, "✅ ACopy notifications work.", CancellationToken.None); return null; }
-        catch (Exception e) { return e.Message; }
+        var errors = new List<string>();
+        foreach (var chat in tg.Value.Chats)
+        {
+            try { await telegram.SendMessageAsync(tg.Value.Bot.ForChat(chat), "✅ ACopy notifications work.", CancellationToken.None); }
+            catch (Exception e) { errors.Add(tg.Value.Chats.Count == 1 ? e.Message : $"chat {chat}: {e.Message}"); }
+        }
+        return errors.Count == 0 ? null : string.Join("; ", errors);
     }
 
     private async Task PostAsync(string url, object payload)

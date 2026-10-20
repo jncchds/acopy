@@ -9,7 +9,7 @@ public record LabelConfig(
     string Key, string Name, Engine Engine, ExecutionMode Mode, string? Host, int? Port, string ContainerName,
     string? User, string? Password, string? PasswordEnv, string? Database, string? Args, string? Extension,
     string Schedule, int Keep, int? MaxAgeDays, NamingMode Naming, Compression Compression, string Folder, int TimeoutMinutes,
-    string? EncryptionKey, IReadOnlyList<string> Destinations, string? RestoreCommand)
+    string? EncryptionKey, IReadOnlyList<string> Destinations, string? RestoreCommand, string? TelegramChats = null)
 {
     /// <summary>Every key ACopy reads, for the UI's label reference.</summary>
     public static readonly IReadOnlyList<(string Key, string Description)> Keys =
@@ -29,6 +29,7 @@ public record LabelConfig(
         ("password", "Literal password (prefer password_env)"),
         ("encryption", "Name of an encryption key defined in ACopy"),
         ("destinations", "Comma-separated destination names to copy each backup to"),
+        ("telegram_chats", "Comma-separated Telegram chat ids for this job's files, instead of each Telegram destination's chat"),
         ("host", "network mode: host (default: container name)"),
         ("port", "network mode: port (default: engine default)"),
         ("args", "Extra arguments for the dump tool; for custom: the shell command"),
@@ -122,6 +123,10 @@ public record LabelConfig(
             int? port = int.TryParse(L("port"), out var p) ? p : null;
             var timeout = int.TryParse(L("timeout"), out var t) && t > 0 ? t : 120;
             var destinations = (L("destinations") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            var chats = ACopy.Api.Destinations.TelegramClient.ParseChats(L("telegram_chats"));
+            if (chats.FirstOrDefault(c => !ACopy.Api.Destinations.TelegramClient.IsValidChat(c)) is { } badChat)
+            { errors.Add($"{where}telegram_chats: '{badChat}' is not a chat id"); return; }
+            var telegramChats = chats.Count > 0 ? string.Join(',', chats) : null;
 
             // database=a,b → one target per database
             var dbLabel = L("database");
@@ -142,7 +147,8 @@ public record LabelConfig(
                     Database: db, Args: L("args") ?? L("command"), Extension: L("extension"),
                     Schedule: schedule, Keep: keep, MaxAgeDays: maxAge, Naming: naming, Compression: compression,
                     Folder: BackupFiles.SafeFolder(folder), TimeoutMinutes: timeout,
-                    EncryptionKey: L("encryption"), Destinations: destinations, RestoreCommand: L("restore_command")));
+                    EncryptionKey: L("encryption"), Destinations: destinations, RestoreCommand: L("restore_command"),
+                    TelegramChats: telegramChats));
             }
         }
     }

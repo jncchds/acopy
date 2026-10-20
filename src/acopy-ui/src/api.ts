@@ -65,6 +65,7 @@ export interface Target {
   encryptionKeyId: number | null
   encryptionKeyName: string | null
   destinationIds: number[]
+  telegramChatIds: string | null
   restoreCommand: string | null
   restoreUnsupported: string | null
   source: 'Manual' | 'DockerLabel'
@@ -103,6 +104,7 @@ export interface TargetInput {
   timeoutMinutes?: number | null
   encryptionKeyId?: number | null
   destinationIds?: number[]
+  telegramChatIds?: string | null
   restoreCommand?: string | null
 }
 
@@ -185,6 +187,8 @@ export interface Meta {
   engines: EngineInfo[]
   labelPrefix: string
   labelKeys: { key: string; description: string }[]
+  /** Bot API server used when a Telegram URL is left blank (ACOPY_Telegram__ApiUrl, else api.telegram.org). */
+  telegramApiUrl: string
 }
 
 export interface Dashboard {
@@ -366,6 +370,8 @@ export const api = {
   deleteDestination: (id: number) => request<void>('DELETE', `/api/destinations/${id}`),
   testDestination: (d: DestinationInput, id?: number) =>
     request<{ ok: boolean; message: string }>('POST', `/api/destinations/test${id ? `?id=${id}` : ''}`, d),
+  telegramLogout: (d: DestinationInput, id?: number) =>
+    request<{ ok: boolean; message: string }>('POST', `/api/destinations/telegram-logout${id ? `?id=${id}` : ''}`, d),
 
   restore: (runId: number, r: RestoreInput) => request<{ runId: number }>('POST', `/api/runs/${runId}/restore`, r),
   retryUpload: (id: number) => request<Upload>('POST', `/api/uploads/${id}/retry`),

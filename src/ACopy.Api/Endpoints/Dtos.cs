@@ -1,4 +1,5 @@
 using ACopy.Api.Data;
+using ACopy.Api.Destinations;
 using ACopy.Api.Engines;
 using ACopy.Api.Services;
 
@@ -28,15 +29,15 @@ public record TargetDto(
     int Id, string Name, string Engine, string Mode, string? Host, int? Port, string? ContainerName,
     string? Username, bool HasPassword, string? PasswordEnv, string? DatabaseName, string? ExtraArgs, string? CustomExtension,
     string Schedule, bool Enabled, int Keep, int? MaxAgeDays, string Naming, string Compression, string Folder, int TimeoutMinutes,
-    int? EncryptionKeyId, string? EncryptionKeyName, IReadOnlyList<int> DestinationIds, string? RestoreCommand, string? RestoreUnsupported,
-    string Source, bool Orphaned, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
+    int? EncryptionKeyId, string? EncryptionKeyName, IReadOnlyList<int> DestinationIds, string? TelegramChatIds, string? RestoreCommand,
+    string? RestoreUnsupported, string Source, bool Orphaned, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
     DateTimeOffset? NextRunAt, bool Active, RunDto? LastRun, DateTimeOffset? LastSuccessAt, long StoredBytes, int StoredFiles)
 {
     public static TargetDto From(BackupTarget t, DateTimeOffset? next, bool active, RunDto? last, DateTimeOffset? lastOk, long bytes, int files) => new(
         t.Id, t.Name, t.Engine.ToString(), t.Mode.ToString(), t.Host, t.Port, t.ContainerName,
         t.Username, !string.IsNullOrEmpty(t.PasswordProtected), t.PasswordEnv, t.DatabaseName, t.ExtraArgs, t.CustomExtension,
         t.Schedule, t.Enabled, t.Keep, t.MaxAgeDays, t.Naming.ToString(), t.Compression.ToString(), t.Folder, t.TimeoutMinutes,
-        t.EncryptionKeyId, t.EncryptionKey?.Name, t.Destinations.Select(d => d.DestinationId).Order().ToList(), t.RestoreCommand,
+        t.EncryptionKeyId, t.EncryptionKey?.Name, t.Destinations.Select(d => d.DestinationId).Order().ToList(), t.TelegramChatIds, t.RestoreCommand,
         RestoreCommandBuilder.UnsupportedReason(t),
         t.Source.ToString(), t.Orphaned, t.CreatedAt, t.UpdatedAt, next, active, last, lastOk, bytes, files);
 }
@@ -45,7 +46,8 @@ public record TargetInput(
     string Name, Engine Engine, ExecutionMode Mode, string? Host, int? Port, string? ContainerName,
     string? Username, string? Password, bool? ClearPassword, string? PasswordEnv, string? DatabaseName, string? ExtraArgs,
     string? CustomExtension, string Schedule, bool Enabled, int Keep, int? MaxAgeDays, NamingMode Naming, Compression Compression,
-    string? Folder, int? TimeoutMinutes, int? EncryptionKeyId, List<int>? DestinationIds, string? RestoreCommand)
+    string? Folder, int? TimeoutMinutes, int? EncryptionKeyId, List<int>? DestinationIds, string? RestoreCommand,
+    string? TelegramChatIds = null)
 {
     public Dictionary<string, string[]> Validate()
     {
@@ -68,6 +70,8 @@ public record TargetInput(
         if (TimeoutMinutes is < 1 or > 24 * 60) e["timeoutMinutes"] = ["Timeout must be 1–1440 minutes"];
         if (CustomExtension != null && CustomExtension.Trim().TrimStart('.').Any(ch => !char.IsAsciiLetterOrDigit(ch) && ch != '.'))
             e["customExtension"] = ["Letters, digits and dots only"];
+        if (TelegramClient.ParseChats(TelegramChatIds).FirstOrDefault(c => !TelegramClient.IsValidChat(c)) is { } badChat)
+            e["telegramChatIds"] = [$"'{badChat}' is not a chat id — use numbers (e.g. -1001234567890) or @channel, separated by commas"];
         return e;
     }
 }

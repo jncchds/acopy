@@ -175,6 +175,17 @@ public static class StorageEndpoints
             if (errors.Count > 0) return Results.ValidationProblem(errors);
             return Results.Ok(await ds.TestAsync(d, ct));
         });
+
+        // Telegram: the one-time logOut from api.telegram.org before the bot moves to a self-hosted Bot API server.
+        // Same input as /test, so it works on unsaved form values (a blank token falls back to the stored one).
+        g.MapPost("/telegram-logout", async (DestinationInput input, int? id, AppDbContext db, DestinationService ds, Secrets secrets, CancellationToken ct) =>
+        {
+            var d = id != null ? await db.Destinations.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id, ct) ?? new Destination { Name = "" } : new Destination { Name = "" };
+            if (input.Kind != DestinationKind.Telegram) return Results.BadRequest();
+            var errors = await ApplyAsync(d, input with { Name = "logout-" + Guid.NewGuid().ToString("N") }, db, secrets);
+            if (errors.ContainsKey("secrets.botToken")) return Results.ValidationProblem(errors);
+            return Results.Ok(await ds.LogOutFromPublicAsync(d, ct));
+        });
     }
 
     private static async Task<Dictionary<string, string[]>> ApplyAsync(Destination d, DestinationInput i, AppDbContext db, Secrets secrets)
@@ -208,7 +219,12 @@ public static class StorageEndpoints
         {
             p = p.Where(kv => kv.Key is "chatId" or "threadId" or "apiUrl" or "maxPartMb").ToDictionary();
             stored = stored.Where(kv => kv.Key == "botToken").ToDictionary();
-            if (!p.ContainsKey("chatId")) e["params.chatId"] = ["Chat id is required"];
+            var chats = TelegramClient.ParseChats(p.GetValueOrDefault("chatId"));
+            if (chats.Count == 0) e["params.chatId"] = ["Chat id is required"];
+            else if (chats.FirstOrDefault(c => !TelegramClient.IsValidChat(c)) is { } bad) e["params.chatId"] = [$"'{bad}' is not a chat id"];
+            else p["chatId"] = string.Join(',', chats);
+            if (p.TryGetValue("apiUrl", out var au) && !(Uri.TryCreate(au, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https"))
+                e["params.apiUrl"] = ["An http(s) URL, e.g. http://telegram-bot-api:8081"];
             if (!stored.ContainsKey("botToken")) e["secrets.botToken"] = ["Bot token is required"];
             if (p.TryGetValue("threadId", out var th) && !int.TryParse(th, out _)) e["params.threadId"] = ["A number"];
             if (p.TryGetValue("maxPartMb", out var mp) && (!int.TryParse(mp, out var mpv) || mpv is < 1 or > 2000)) e["params.maxPartMb"] = ["1–2000"];

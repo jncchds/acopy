@@ -32,6 +32,15 @@ public class AuthOptions
     public string? Password { get; set; }
 }
 
+public class TelegramOptions
+{
+    /// <summary>
+    /// Bot API server used when a destination or the notification settings leave the URL blank — e.g. a
+    /// self-hosted <c>http://telegram-bot-api:8081</c>. Empty = the public https://api.telegram.org.
+    /// </summary>
+    public string? ApiUrl { get; set; }
+}
+
 public class BackupOptions
 {
     public int MaxParallel { get; set; } = 2;

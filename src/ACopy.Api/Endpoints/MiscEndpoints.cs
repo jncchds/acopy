@@ -59,8 +59,10 @@ public static class MiscEndpoints
 
     public static void MapSystemEndpoints(this RouteGroupBuilder api)
     {
-        api.MapGet("/meta", (IOptions<DockerOptions> docker) => new
+        api.MapGet("/meta", (IOptions<DockerOptions> docker, ACopy.Api.Destinations.TelegramClient telegram) => new
         {
+            // Used when a Telegram destination or the notification settings leave the Bot API URL blank
+            telegramApiUrl = telegram.DefaultApiUrl,
             version = AppVersion.Value,
             engines = EngineCatalog.All.Select(e => new
             {

@@ -181,6 +181,9 @@ namespace ACopy.Api.Data.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("TelegramChatIds")
+                        .HasColumnType("TEXT");
+
                     b.Property<int>("TimeoutMinutes")
                         .HasColumnType("INTEGER");
 

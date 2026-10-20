@@ -3,6 +3,8 @@ import { api, ApiError, apiError, type Backend, type Destination, type Destinati
 import ToggleField from '../components/ToggleField'
 import { useToast } from '../components/Bits'
 
+const PUBLIC_API = 'https://api.telegram.org'
+
 export default function Destinations() {
   const [list, setList] = useState<Destination[] | null>(null)
   const [backends, setBackends] = useState<Backend[]>([])
@@ -21,7 +23,10 @@ export default function Destinations() {
   }
 
   const describe = (d: Destination) => {
-    if (d.kind === 'Telegram') return `Telegram chat ${d.params.chatId ?? ''}${d.params.threadId ? ` · topic ${d.params.threadId}` : ''}`
+    if (d.kind === 'Telegram') {
+      const chats = (d.params.chatId ?? '').split(',').filter(Boolean)
+      return `Telegram chat${chats.length === 1 ? '' : 's'} ${chats.join(', ')}${d.params.threadId ? ` · topic ${d.params.threadId}` : ''}${d.params.apiUrl ? ` · ${d.params.apiUrl}` : ''}`
+    }
     const b = backends.find(x => x.type === d.rcloneType)
     const where = d.rcloneType === 'other' ? d.params.type : b?.label ?? d.rcloneType
     return `${where} · ${d.params.host ?? d.params.endpoint ?? d.params.url ?? ''} ${d.remotePath ?? ''}`.trim()
@@ -100,8 +105,12 @@ function DestinationForm({ existing, backends, onDone }: {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [test, setTest] = useState<{ ok: boolean; message: string } | null>(null)
+  const [defaultApi, setDefaultApi] = useState(PUBLIC_API)
+  useEffect(() => { api.meta().then(m => setDefaultApi(m.telegramApiUrl)).catch(() => {}) }, [])
 
   const backend = backends.find(b => b.type === type)
+  const effectiveApi = (params.apiUrl?.trim() || defaultApi).replace(/\/$/, '')
+  const selfHosted = effectiveApi !== PUBLIC_API
   const stored = new Set(existing?.secretKeys ?? [])
 
   const input = (): DestinationInput => ({
@@ -127,6 +136,16 @@ function DestinationForm({ existing, backends, onDone }: {
   const doTest = async () => {
     setBusy(true); setTest(null)
     try { setTest(await api.testDestination(input(), existing?.id)) }
+    catch (e) { setTest({ ok: false, message: apiError(e) }) }
+    finally { setBusy(false) }
+  }
+
+  const logOutPublic = async () => {
+    if (!confirm('Log this bot out of api.telegram.org so it can use the self-hosted Bot API server?\n\n' +
+      'Do this once, when moving the bot. It cannot log back in to the public server for 10 minutes, and anything ' +
+      'else that uses this bot through api.telegram.org stops working.')) return
+    setBusy(true); setTest(null)
+    try { setTest(await api.telegramLogout(input(), existing?.id)) }
     catch (e) { setTest({ ok: false, message: apiError(e) }) }
     finally { setBusy(false) }
   }
@@ -212,16 +231,31 @@ function DestinationForm({ existing, backends, onDone }: {
         <>
           <p className="callout-info" style={{ marginBottom: '0.9rem' }}>
             Create a bot with @BotFather, add it to the chat (or open a private chat with it), and use the chat id
-            (e.g. <code>-1001234567890</code> for groups). The public Bot API accepts files up to 50 MB — larger
-            backups are split into numbered parts (<code>cat file.* &gt; file</code> to join). With a self-hosted
-            Bot API server the limit is 2 GB.
+            (e.g. <code>-1001234567890</code> for groups). {selfHosted
+              ? <>This destination uses the self-hosted Bot API server at <code>{effectiveApi}</code> — files up to 2 GB
+                  per part.</>
+              : <>The public Bot API accepts files up to 50 MB — larger backups are split into numbered parts
+                  (<code>cat file.* &gt; file</code> to join). A self-hosted Bot API server raises that to 2 GB (see the README).</>}
           </p>
           <div className="form-grid">
             {secretInput('botToken', 'Bot token', false, '123456:ABC…')}
-            <label>Chat id<input value={params.chatId ?? ''} onChange={e => setP('chatId', e.target.value)} placeholder="-1001234567890" />{err('params.chatId')}</label>
+            <label>
+              Chat ids
+              <input className="mono" value={params.chatId ?? ''} onChange={e => setP('chatId', e.target.value)} placeholder="-1001234567890, 123456789" />
+              <span className="hint">Comma-separated; each chat gets every file. A database can name its own chats instead.</span>
+              {err('params.chatId')}
+            </label>
             <label>Topic / thread id (optional)<input value={params.threadId ?? ''} onChange={e => setP('threadId', e.target.value)} />{err('params.threadId')}</label>
-            <label>Part size, MB (optional)<input value={params.maxPartMb ?? ''} onChange={e => setP('maxPartMb', e.target.value)} placeholder="49 (or 1990 for a local Bot API server)" />{err('params.maxPartMb')}</label>
-            <label className="span-2">Bot API URL (optional)<input value={params.apiUrl ?? ''} onChange={e => setP('apiUrl', e.target.value)} placeholder="https://api.telegram.org — or http://telegram-bot-api:8081" /></label>
+            <label>Part size, MB (optional)<input value={params.maxPartMb ?? ''} onChange={e => setP('maxPartMb', e.target.value)} placeholder={selfHosted ? '1990' : '49'} />{err('params.maxPartMb')}</label>
+            <label>
+              Bot API URL (optional)
+              <input className="mono" value={params.apiUrl ?? ''} onChange={e => setP('apiUrl', e.target.value)} placeholder={defaultApi} />
+              <span className="hint">
+                Blank = {defaultApi === PUBLIC_API ? 'the public server' : <>the server set by <code>ACOPY_Telegram__ApiUrl</code></>}.
+                Self-hosted: <code>http://telegram-bot-api:8081</code>
+              </span>
+              {err('params.apiUrl')}
+            </label>
           </div>
         </>
       )}
@@ -242,6 +276,10 @@ function DestinationForm({ existing, backends, onDone }: {
       <div className="form-actions" style={{ marginTop: '0.75rem' }}>
         <button className="btn-primary" onClick={save} disabled={busy || !name}>{existing ? 'Save' : 'Add destination'}</button>
         <button className="btn-ghost" onClick={doTest} disabled={busy}>🔌 Test</button>
+        {kind === 'Telegram' && selfHosted && (
+          <button className="btn-ghost" onClick={logOutPublic} disabled={busy}
+                  title="One-time step when moving a bot from api.telegram.org to a self-hosted server">🚚 Log out from public API</button>
+        )}
         <button className="btn-ghost" onClick={() => onDone(false)}>Cancel</button>
         {test && <span className={test.ok ? 'ok-msg' : 'error-msg'}>{test.ok ? '✓' : '✗'} {test.message}</span>}
       </div>

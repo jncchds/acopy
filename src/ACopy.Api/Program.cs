@@ -18,6 +18,7 @@ builder.Services.Configure<PathsOptions>(builder.Configuration.GetSection("Paths
 builder.Services.Configure<DockerOptions>(builder.Configuration.GetSection("Docker"));
 builder.Services.Configure<AuthOptions>(builder.Configuration.GetSection("Auth"));
 builder.Services.Configure<BackupOptions>(builder.Configuration.GetSection("Backup"));
+builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection("Telegram"));
 
 var paths = builder.Configuration.GetSection("Paths").Get<PathsOptions>() ?? new PathsOptions();
 var authOptions = builder.Configuration.GetSection("Auth").Get<AuthOptions>() ?? new AuthOptions();

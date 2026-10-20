@@ -19,7 +19,7 @@ const EMPTY: TargetInput = {
   name: '', engine: 'PostgreSql', mode: 'DockerExec', host: '', port: null, containerName: '', username: '', password: '',
   passwordEnv: '', databaseName: '', extraArgs: '', customExtension: '', schedule: '0 3 * * *', enabled: true, keep: 7,
   naming: 'Timestamp', compression: 'Gzip', folder: '', timeoutMinutes: 120,
-  maxAgeDays: null, encryptionKeyId: null, destinationIds: [], restoreCommand: '',
+  maxAgeDays: null, encryptionKeyId: null, destinationIds: [], telegramChatIds: '', restoreCommand: '',
 }
 
 function fromTarget(t: Target): TargetInput {
@@ -28,7 +28,7 @@ function fromTarget(t: Target): TargetInput {
     username: t.username ?? '', password: '', passwordEnv: t.passwordEnv ?? '', databaseName: t.databaseName ?? '',
     extraArgs: t.extraArgs ?? '', customExtension: t.customExtension ?? '', schedule: t.schedule, enabled: t.enabled,
     keep: t.keep, naming: t.naming, compression: t.compression, folder: t.folder, timeoutMinutes: t.timeoutMinutes,
-    maxAgeDays: t.maxAgeDays, encryptionKeyId: t.encryptionKeyId, destinationIds: t.destinationIds, restoreCommand: t.restoreCommand ?? '',
+    maxAgeDays: t.maxAgeDays, encryptionKeyId: t.encryptionKeyId, destinationIds: t.destinationIds, telegramChatIds: t.telegramChatIds ?? '', restoreCommand: t.restoreCommand ?? '',
   }
 }
 
@@ -171,6 +171,7 @@ export default function TargetEdit() {
     if (key) l.push(`${p}.encryption: "${key.name}"`)
     const names = dests.filter(d => f.destinationIds?.includes(d.id)).map(d => d.name)
     if (names.length) l.push(`${p}.destinations: "${names.join(',')}"`)
+    if (f.telegramChatIds?.trim()) l.push(`${p}.telegram_chats: "${f.telegramChatIds.split(',').map(s => s.trim()).filter(Boolean).join(',')}"`)
     if (f.engine === 'Custom' && f.restoreCommand) l.push(`${p}.restore_command: "${f.restoreCommand.replace(/"/g, '\\"')}"`)
     return l.map(x => `      ${x}`).join('\n')
   }, [f, meta, keys, dests])
@@ -179,6 +180,7 @@ export default function TargetEdit() {
   if (!isNew && !existing) return <p className="empty">This database no longer exists.</p>
 
   const err = (k: string) => errors[k]?.map(m => <span key={m} className="field-error">{m}</span>)
+  const tgSelected = dests.filter(d => d.kind === 'Telegram' && f.destinationIds?.includes(d.id))
 
   return (
     <div className="page page-narrow" style={{ maxWidth: 820 }}>
@@ -429,6 +431,19 @@ export default function TargetEdit() {
             )}
             {err('destinationIds')}
           </label>
+          {(tgSelected.length > 0 || !!f.telegramChatIds) && (
+            <label className="span-2">
+              Telegram chats for this database (optional)
+              <input className="mono" value={f.telegramChatIds ?? ''} onChange={e => set('telegramChatIds', e.target.value)}
+                     placeholder={tgSelected.map(d => d.params.chatId).filter(Boolean).join(', ') || '-1001234567890, 123456789'} />
+              <span className="hint">
+                Comma-separated chat ids — each one gets every file (uploaded once, forwarded by Telegram). Replaces the chat
+                of {tgSelected.length ? tgSelected.map(d => d.name).join(', ') : 'the Telegram destinations'}; blank = the destination's chat.
+                People must have started a chat with the bot (or be in the group) first.
+              </span>
+              {err('telegramChatIds')}
+            </label>
+          )}
         </div>
       </fieldset>
 

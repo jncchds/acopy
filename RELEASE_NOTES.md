@@ -1,5 +1,18 @@
 # Release notes
 
+## Unreleased
+
+### Telegram
+- **Chats per database:** a database (or the `acopy.telegram_chats` label, also per job) can name its own
+  comma-separated Telegram chats, replacing the destination's chat — send each backup to the people
+  responsible for it. Destination and notification chat ids also accept several chats.
+- Each part is uploaded once and sent to further chats by file id. When some chats refuse a file, the upload
+  is marked failed with the reason, the other chats keep their copy, and **Retry** only sends to the missing
+  ones. Retention deletes old messages in every chat.
+- **Self-hosted Bot API server:** an optional `telegram-bot-api` service in `docker-compose.yml`
+  (`--profile telegram`), `ACOPY_Telegram__ApiUrl` as the default server for every Telegram URL left blank,
+  and a **Log out from public API** button to move a bot over. Files up to 2 GB per part.
+
 ## v0.1.0 — 2026-10-19
 
 First release. ACopy backs up the databases on a Docker host on a schedule, keeps the last N copies (or the

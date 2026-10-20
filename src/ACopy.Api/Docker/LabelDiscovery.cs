@@ -115,7 +115,7 @@ public class LabelDiscovery(
             t.DatabaseName != c.Database || t.ExtraArgs != c.Args || t.CustomExtension != c.Extension ||
             t.Schedule != c.Schedule || t.Keep != c.Keep || t.MaxAgeDays != c.MaxAgeDays || t.Naming != c.Naming ||
             t.Compression != c.Compression || t.Folder != c.Folder || t.TimeoutMinutes != c.TimeoutMinutes ||
-            t.EncryptionKeyId != keyId || t.RestoreCommand != c.RestoreCommand ||
+            t.EncryptionKeyId != keyId || t.RestoreCommand != c.RestoreCommand || t.TelegramChatIds != c.TelegramChats ||
             !currentDests.SequenceEqual(destIds.Distinct().Order()) || t.Orphaned;
         if (!changed) return;
 
@@ -124,7 +124,7 @@ public class LabelDiscovery(
         t.DatabaseName = c.Database; t.ExtraArgs = c.Args; t.CustomExtension = c.Extension;
         t.Schedule = c.Schedule; t.Keep = c.Keep; t.MaxAgeDays = c.MaxAgeDays; t.Naming = c.Naming; t.Compression = c.Compression;
         t.Folder = c.Folder; t.TimeoutMinutes = c.TimeoutMinutes; t.Orphaned = false;
-        t.EncryptionKeyId = keyId; t.RestoreCommand = c.RestoreCommand;
+        t.EncryptionKeyId = keyId; t.RestoreCommand = c.RestoreCommand; t.TelegramChatIds = c.TelegramChats;
         t.Destinations.RemoveAll(d => !destIds.Contains(d.DestinationId));
         foreach (var id in destIds.Distinct().Where(id => t.Destinations.All(d => d.DestinationId != id)))
             t.Destinations.Add(new TargetDestination { DestinationId = id });

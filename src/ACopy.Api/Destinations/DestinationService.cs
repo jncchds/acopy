@@ -16,10 +16,13 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
 
     // ── Upload ──
 
-    /// <summary>Uploads one backup file; returns the remote reference (path, or Telegram message ids).</summary>
-    public async Task<string> UploadAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string folderRel, string fileName, CancellationToken ct)
+    /// <summary>Uploads one backup file; returns the remote reference (path, or Telegram chats and message ids).</summary>
+    /// <param name="previousRef">Telegram retry: the reference of the earlier attempt — chats that already got the file are skipped.</param>
+    /// <exception cref="PartialUploadException">Telegram: some chats got the file, others did not.</exception>
+    public async Task<string> UploadAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string folderRel, string fileName,
+        CancellationToken ct, string? previousRef = null)
     {
-        if (d.Kind == DestinationKind.Telegram) return await UploadTelegramAsync(d, t, run, localPath, fileName, ct);
+        if (d.Kind == DestinationKind.Telegram) return await UploadTelegramAsync(d, t, run, localPath, fileName, previousRef, ct);
 
         var remote = Join(Join(RemoteBase(d), folderRel), fileName);
         var env = await RcloneEnvAsync(d, ct);
@@ -28,19 +31,27 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         return remote;
     }
 
-    private async Task<string> UploadTelegramAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string fileName, CancellationToken ct)
+    /// <summary>
+    /// Sends the file (split into parts above the size limit) to every chat of the job. Each part is uploaded once and
+    /// sent to the other chats by its file id. A chat that fails is reported; the others keep their copy.
+    /// </summary>
+    private async Task<string> UploadTelegramAsync(Destination d, BackupTarget t, BackupRun run, string localPath, string fileName, string? previousRef, CancellationToken ct)
     {
-        var tg = TelegramOf(d);
+        var (bot, chats) = TelegramOf(d, t);
         var p = Params(d);
-        var defaultLimit = tg.ApiUrl.TrimEnd('/') == TelegramClient.DefaultApi ? 49 : 1990;
+        var defaultLimit = TelegramClient.IsPublic(bot.ApiUrl) ? 49 : 1990;
         var partMb = p.TryGetValue("maxPartMb", out var m) && int.TryParse(m, out var mb) && mb > 0 ? mb : defaultLimit;
         var partBytes = (long)partMb * 1024 * 1024;
 
+        var done = TelegramRef.Parse(previousRef, LegacyChat(d));
+        var pending = chats.Where(c => !done.ContainsKey(c)).ToList();
+        var sent = pending.ToDictionary(c => c, _ => new List<long>(), StringComparer.Ordinal);
+        var failed = new Dictionary<string, string>(StringComparer.Ordinal);
+
         var size = new FileInfo(localPath).Length;
         var parts = (int)Math.Max(1, (size + partBytes - 1) / partBytes);
-        var ids = new List<long>();
         await using var file = File.OpenRead(localPath);
-        for (var i = 0; i < parts; i++)
+        for (var i = 0; i < parts && pending.Count > failed.Count; i++)
         {
             var offset = i * partBytes;
             var len = Math.Min(partBytes, size - offset);
@@ -50,11 +61,43 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
                 .Append($"<code>{TelegramClient.Escape(fileName)}</code> · {Notifier.FormatSize(size)}");
             if (parts > 1) caption.Append($"\npart {i + 1}/{parts} — join with <code>cat {TelegramClient.Escape(fileName)}.* &gt; {TelegramClient.Escape(fileName)}</code>");
             if (i == 0 && run.Sha256 != null) caption.Append($"\nsha256 <code>{run.Sha256}</code>");
-            await using var part = new SubStream(file, offset, len);
-            ids.Add(await telegram.SendDocumentAsync(tg, part, name, caption.ToString(), ct));
+
+            string? fileId = null;
+            foreach (var chat in pending.Where(c => !failed.ContainsKey(c)))
+            {
+                try
+                {
+                    SentDocument msg;
+                    if (fileId != null) msg = await telegram.SendDocumentByIdAsync(bot.ForChat(chat), fileId, caption.ToString(), ct);
+                    else
+                    {
+                        await using var part = new SubStream(file, offset, len);
+                        msg = await telegram.SendDocumentAsync(bot.ForChat(chat), part, name, caption.ToString(), ct);
+                        fileId = msg.FileId;
+                    }
+                    sent[chat].Add(msg.MessageId);
+                }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    failed[chat] = e.Message;
+                    // An incomplete set of parts is useless — take back what this chat already got
+                    foreach (var id in sent[chat])
+                        try { await telegram.DeleteMessageAsync(bot.ForChat(chat), id, ct); } catch (Exception) { /* best effort */ }
+                    sent[chat].Clear();
+                }
+            }
         }
-        return string.Join(',', ids);
+
+        foreach (var (chat, ids) in sent) if (ids.Count > 0) done[chat] = ids;
+        var remoteRef = TelegramRef.Format(done);
+        if (failed.Count == 0) return remoteRef;
+        var error = string.Join("; ", failed.Select(f => $"chat {f.Key}: {f.Value}"));
+        if (done.Count == 0) throw new InvalidOperationException(error);
+        throw new PartialUploadException(remoteRef, $"sent to {done.Count} of {done.Count + failed.Count} chats — {error}");
     }
+
+    /// <summary>The chat of an upload recorded before multi-chat support (the reference then held message ids only).</summary>
+    private string? LegacyChat(Destination d) => TelegramClient.ParseChats(Params(d).GetValueOrDefault("chatId")).FirstOrDefault();
 
     // ── Remote retention ──
 
@@ -90,22 +133,26 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
 
     private async Task PruneTelegramAsync(Destination d, BackupTarget t, RetentionPolicy policy, AppDbContext db, StringBuilder runLog, CancellationToken ct)
     {
+        // Partly failed uploads (some chats got the file) count too — their messages must be cleaned up as well
         var uploads = await db.Uploads.Include(u => u.Run)
-            .Where(u => u.DestinationId == d.Id && u.Status == UploadStatus.Succeeded && !u.Deleted && u.Run!.TargetId == t.Id)
+            .Where(u => u.DestinationId == d.Id && !u.Deleted && u.Run!.TargetId == t.Id &&
+                        (u.Status == UploadStatus.Succeeded || (u.Status == UploadStatus.Failed && u.RemoteRef != null)))
             .ToListAsync(ct);
         var ordered = uploads.OrderByDescending(u => u.Run!.StartedAt).ToList();
         var keep = t.Naming == NamingMode.Rolling ? Math.Max(1, policy.Keep) : policy.Keep;
-        var tg = TelegramOf(d);
+        var (bot, _) = TelegramOf(d, null, requireChat: false);
+        var legacyChat = LegacyChat(d);
         for (var i = 1; i < ordered.Count; i++)
         {
             var u = ordered[i];
             var beyond = keep > 0 && i >= keep;
             var old = policy.MaxAgeDays is > 0 && DateTimeOffset.UtcNow - u.Run!.StartedAt > TimeSpan.FromDays(policy.MaxAgeDays.Value);
             if (!beyond && !old) continue;
-            foreach (var id in (u.RemoteRef ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+            foreach (var (chat, ids) in TelegramRef.Parse(u.RemoteRef, legacyChat))
+            foreach (var id in ids)
             {
-                try { await telegram.DeleteMessageAsync(tg, long.Parse(id), ct); }
-                catch (Exception e) { runLog.AppendLine($"{d.Name}: could not delete message {id}: {e.Message}"); }
+                try { await telegram.DeleteMessageAsync(bot.ForChat(chat), id, ct); }
+                catch (Exception e) { runLog.AppendLine($"{d.Name}: could not delete message {id} in chat {chat}: {e.Message}"); }
             }
             u.Deleted = true;
             runLog.AppendLine($"{d.Name}: retention removed the upload of run #{u.RunId}");
@@ -133,10 +180,18 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
         {
             if (d.Kind == DestinationKind.Telegram)
             {
-                var tg = TelegramOf(d);
+                var (tg, chats) = TelegramOf(d, null);
                 var bot = await telegram.GetMeAsync(tg, ct);
-                await telegram.SendMessageAsync(tg, $"✅ ACopy destination <b>{TelegramClient.Escape(d.Name)}</b> works.", ct);
-                return new(true, $"@{bot} posted a test message to chat {tg.ChatId}");
+                var failures = new List<string>();
+                foreach (var chat in chats)
+                {
+                    try { await telegram.SendMessageAsync(tg.ForChat(chat), $"✅ ACopy destination <b>{TelegramClient.Escape(d.Name)}</b> works.", ct); }
+                    catch (Exception e) when (e is not OperationCanceledException) { failures.Add($"chat {chat}: {e.Message}"); }
+                }
+                var server = TelegramClient.IsPublic(tg.ApiUrl) ? "" : $" via {tg.ApiUrl}";
+                return failures.Count == 0
+                    ? new(true, $"@{bot}{server} posted a test message to chat{(chats.Count == 1 ? "" : "s")} {string.Join(", ", chats)}")
+                    : new(false, $"@{bot}{server}: {string.Join("; ", failures)}");
             }
             var env = await RcloneEnvAsync(d, ct);
             var basePath = RemoteBase(d);
@@ -155,15 +210,33 @@ public class DestinationService(Secrets secrets, TelegramClient telegram)
     public Dictionary<string, string> Params(Destination d) =>
         JsonSerializer.Deserialize<Dictionary<string, string>>(d.ParamsJson) ?? [];
 
-    public TelegramTarget TelegramOf(Destination d)
+    /// <summary>
+    /// The bot of a Telegram destination and the chats to send to: the job's own chat list when it has one, otherwise
+    /// the destination's. The forum topic only applies to the destination's chats.
+    /// </summary>
+    public (TelegramTarget Bot, List<string> Chats) TelegramOf(Destination d, BackupTarget? job, bool requireChat = true)
     {
         var p = Params(d);
         var s = secrets.UnprotectMap(d.SecretsProtected);
         if (!s.TryGetValue("botToken", out var token) || string.IsNullOrWhiteSpace(token)) throw new InvalidOperationException("Telegram bot token is missing");
-        if (!p.TryGetValue("chatId", out var chat) || string.IsNullOrWhiteSpace(chat)) throw new InvalidOperationException("Telegram chat id is missing");
-        int? thread = p.TryGetValue("threadId", out var th) && int.TryParse(th, out var ti) ? ti : null;
-        var api = p.TryGetValue("apiUrl", out var a) && !string.IsNullOrWhiteSpace(a) ? a.Trim() : TelegramClient.DefaultApi;
-        return new TelegramTarget(token.Trim(), chat.Trim(), thread, api);
+        var jobChats = TelegramClient.ParseChats(job?.TelegramChatIds);
+        var chats = jobChats.Count > 0 ? jobChats : TelegramClient.ParseChats(p.GetValueOrDefault("chatId"));
+        if (requireChat && chats.Count == 0) throw new InvalidOperationException("Telegram chat id is missing");
+        int? thread = jobChats.Count == 0 && p.TryGetValue("threadId", out var th) && int.TryParse(th, out var ti) ? ti : null;
+        var api = telegram.ResolveApiUrl(p.GetValueOrDefault("apiUrl"));
+        return (new TelegramTarget(token.Trim(), chats.FirstOrDefault() ?? "", thread, api), chats);
+    }
+
+    /// <summary>The one-time logOut from api.telegram.org before the destination's bot moves to a self-hosted server.</summary>
+    public async Task<DestinationTestResult> LogOutFromPublicAsync(Destination d, CancellationToken ct)
+    {
+        try
+        {
+            var (bot, _) = TelegramOf(d, null, requireChat: false);
+            await telegram.LogOutFromPublicAsync(bot.Token, ct);
+            return new(true, "Logged out from api.telegram.org — the bot can now use a self-hosted Bot API server (it cannot log back in to the public one for 10 minutes)");
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { return new(false, e.Message); }
     }
 
     public static string RemoteBase(Destination d)
@@ -294,4 +367,10 @@ internal sealed class SubStream(Stream inner, long offset, long length) : Stream
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int off, int count) => throw new NotSupportedException();
     protected override void Dispose(bool disposing) { /* the caller owns the inner stream */ }
+}
+
+/// <summary>A Telegram upload that reached some chats but not all; <see cref="RemoteRef"/> records the ones that got it.</summary>
+public sealed class PartialUploadException(string remoteRef, string message) : Exception(message)
+{
+    public string RemoteRef { get; } = remoteRef;
 }
