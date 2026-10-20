@@ -4,6 +4,15 @@
 # or another non-root process picks them up. The user is added to the Docker socket's group.
 set -e
 
+# Backups are background work: run ACopy and every dump/compress/upload it starts at low CPU and disk
+# priority so a large backup never starves the databases and services it shares the host with.
+# NICE=0 turns this off. (Dumps in exec mode run inside the database container and are not affected.)
+NICE="${NICE:-10}"
+if [ "$NICE" != "0" ]; then
+  renice -n "$NICE" -p $$ >/dev/null 2>&1 || true
+  ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
+fi
+
 if [ -n "$PUID" ] && [ "$PUID" != "0" ]; then
   PGID="${PGID:-$PUID}"
   getent group acopy >/dev/null 2>&1 || addgroup -g "$PGID" acopy 2>/dev/null || addgroup acopy

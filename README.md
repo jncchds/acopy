@@ -301,11 +301,13 @@ Everything in `appsettings.json` can be overridden with `ACOPY_`-prefixed enviro
 | `ACOPY_Docker__ScanSeconds` | `60` | Label re-scan interval |
 | `ACOPY_Backup__MaxParallel` | `2` | Jobs running at the same time |
 | `ACOPY_Backup__HistoryPerTarget` | `200` | Run-history rows kept per database (rows of files still on disk are kept) |
+| `ACOPY_Backup__SyncEveryMb` | `32` | Force backup files to disk every N MB written, so a large backup cannot pile up unwritten data that stalls the host when flushed (`0` = off) |
 | `ACOPY_Telegram__ApiUrl` | `https://api.telegram.org` | Bot API server for Telegram destinations and notifications that leave the URL blank (e.g. `http://telegram-bot-api:8081`) |
 | `ACOPY_Telegram__UploadDir` / `ACOPY_Telegram__ServerUploadDir` | — | Shared upload folder as ACopy / the self-hosted server see it — files go by path instead of HTTP (both needed) |
 | `TZ` | `UTC` | Default time zone (also editable in Settings) |
 | `PUID` / `PGID` | — (root) | Run as this user/group; backup files are owned by it |
 | `UMASK` | `022` | File-creation mask |
+| `NICE` | `10` | CPU priority of ACopy and the dumps it runs (disk priority is lowered too); `0` = normal priority |
 
 Webhook, Telegram, "notify on success" and the time zone are set in the UI (Settings).
 

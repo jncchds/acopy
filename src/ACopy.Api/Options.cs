@@ -57,4 +57,9 @@ public class BackupOptions
     /// <summary>Run-history rows kept per target (files are governed by Keep, not this).</summary>
     public int HistoryPerTarget { get; set; } = 200;
     public int LogMaxChars { get; set; } = 16_000;
+    /// <summary>
+    /// Force a backup file to disk after every this many MB written (0 = leave it to the kernel). Keeps a large
+    /// backup from piling up gigabytes of unwritten data whose flush stalls the whole host.
+    /// </summary>
+    public int SyncEveryMb { get; set; } = 32;
 }

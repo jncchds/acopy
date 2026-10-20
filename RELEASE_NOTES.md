@@ -5,6 +5,12 @@
 Telegram grows up: per-database recipients, a self-hosted Bot API server for files up to 2 GB, and backups that
 stay in the chat for good.
 
+### Backups no longer stall the host
+- Backup files are forced to disk every 32 MB (`ACOPY_Backup__SyncEveryMb`) instead of piling up gigabytes of
+  unwritten data in memory, whose flush could freeze every service on the host for a while.
+- ACopy and the dumps, compression and uploads it runs now use low CPU and disk priority (`NICE`, default
+  `10`; `0` restores normal priority).
+
 ### Telegram
 - **Chats per database.** A database can name its own Telegram chats (*Telegram chats* in the editor, or the
   `acopy.telegram_chats` label — also per job), replacing the destination's chat: each backup goes to the people
