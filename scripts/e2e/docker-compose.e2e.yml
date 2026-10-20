@@ -43,6 +43,8 @@ services:
 
   mariadb:
     image: mariadb:11
+    # Disabled event scheduler: MariaDB refuses SHOW EVENTS (1577), so ACopy must dump again without --events
+    command: ["--event-scheduler=DISABLED"]
     environment: { MARIADB_ROOT_PASSWORD: maria-secret, MARIADB_DATABASE: shop }
     labels:
       acopy.enable: "true"

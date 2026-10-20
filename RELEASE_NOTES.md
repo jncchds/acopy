@@ -1,5 +1,11 @@
 # Release notes
 
+## v0.2.2 — 2026-10-20
+
+### Fixes
+- **MariaDB/MySQL with the event scheduler disabled** (`event_scheduler=DISABLED`) no longer fail with
+  *"Couldn't execute 'show events' … (1577)"*: the dump runs again without `--events`, and the run log says so.
+
 ## v0.2.1 — 2026-10-20
 
 ### Backups no longer stall the host

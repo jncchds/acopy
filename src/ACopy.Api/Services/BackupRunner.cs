@@ -210,43 +210,58 @@ public class BackupRunner
         {
             var (creds, containerId) = await ResolveAsync(target, log, ct);
             cmd = DumpCommandBuilder.Build(target, creds, workDir);
-            long rawBytes;
 
-            AgeProcess? age = null;
-            try
+            // Dump → compress → encrypt into the temp file; returns the uncompressed size
+            async Task<long> WriteDumpAsync(DumpCommand dump)
             {
-                await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, 1 << 16, useAsync: true))
+                AgeProcess? age = null;
+                try
                 {
-                    Stream sink = file;
-                    if (key?.Kind == KeyKind.Age)
+                    long written;
+                    await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, 1 << 16, useAsync: true))
                     {
-                        // age writes the ciphertext itself; we stream compressed plaintext into its stdin
-                        file.Close();
-                        age = Encryption.StartAgeEncrypt(Encryption.ParseRecipients(key.Recipients), tempPath);
-                        sink = new NonClosingStream(age.Input); // CompleteAsync closes stdin
-                    }
-                    else if (key?.Kind == KeyKind.Passphrase)
-                    {
-                        var pass = _secrets.Unprotect(key.SecretProtected) ?? throw new InvalidOperationException($"Key '{key.Name}' has no passphrase");
-                        sink = Encryption.PassphraseEncrypt(file, pass);
-                    }
+                        Stream sink = file;
+                        if (key?.Kind == KeyKind.Age)
+                        {
+                            // age writes the ciphertext itself; we stream compressed plaintext into its stdin
+                            file.Close();
+                            age = Encryption.StartAgeEncrypt(Encryption.ParseRecipients(key.Recipients), tempPath);
+                            sink = new NonClosingStream(age.Input); // CompleteAsync closes stdin
+                        }
+                        else if (key?.Kind == KeyKind.Passphrase)
+                        {
+                            var pass = _secrets.Unprotect(key.SecretProtected) ?? throw new InvalidOperationException($"Key '{key.Name}' has no passphrase");
+                            sink = Encryption.PassphraseEncrypt(file, pass);
+                        }
 
-                    await using (var encrypted = sink == file ? new NonClosingStream(file) : sink)
-                    await using (var compressed = Compress(encrypted, target.Compression))
-                    await using (var synced = new SyncingStream(compressed, tempPath, SyncEveryBytes))
-                    {
-                        var counting = new CountingStream(synced);
-                        if (cmd.SqliteSourcePath != null) await SqliteBackupAsync(cmd.SqliteSourcePath, workDir, counting, ct);
-                        else if (target.Mode == ExecutionMode.DockerExec) await ExecInContainerAsync(containerId!, cmd, counting, log, ct);
-                        else await RunProcessAsync(cmd, counting, log, ct);
-                        rawBytes = counting.Written;
+                        await using (var encrypted = sink == file ? new NonClosingStream(file) : sink)
+                        await using (var compressed = Compress(encrypted, target.Compression))
+                        await using (var synced = new SyncingStream(compressed, tempPath, SyncEveryBytes))
+                        {
+                            var counting = new CountingStream(synced);
+                            if (dump.SqliteSourcePath != null) await SqliteBackupAsync(dump.SqliteSourcePath, workDir, counting, ct);
+                            else if (target.Mode == ExecutionMode.DockerExec) await ExecInContainerAsync(containerId!, dump, counting, log, ct);
+                            else await RunProcessAsync(dump, counting, log, ct);
+                            written = counting.Written;
+                        }
                     }
+                    if (age != null) await age.CompleteAsync(ct);
+                    return written;
                 }
-                if (age != null) await age.CompleteAsync(ct);
+                finally
+                {
+                    if (age != null) await age.DisposeAsync();
+                }
             }
-            finally
+
+            long rawBytes;
+            try { rawBytes = await WriteDumpAsync(cmd); }
+            catch (InvalidOperationException e) when (DumpCommandBuilder.IsEventSchedulerDisabled(e.Message) && DumpCommandBuilder.WithoutEvents(cmd) is { } retry)
             {
-                if (age != null) await age.DisposeAsync();
+                // The server runs with event_scheduler=DISABLED, so it refuses to list events at all
+                log.AppendLine("note: the server's event scheduler is disabled, so events cannot be read — dumped again without --events");
+                cmd = retry;
+                rawBytes = await WriteDumpAsync(cmd);
             }
 
             if (rawBytes == 0) throw new InvalidOperationException("The dump produced no output");
