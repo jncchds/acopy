@@ -10,7 +10,7 @@ namespace ACopy.Api.Destinations;
 public record DestinationTestResult(bool Ok, string Message);
 
 /// <summary>Copies finished backups to destinations (rclone backends, Telegram) and applies remote retention.</summary>
-public class DestinationService(Secrets secrets, TelegramClient telegram, SettingsStore settings)
+public class DestinationService(Secrets secrets, TelegramClient telegram, SettingsStore settings, Microsoft.Extensions.Options.IOptions<BackupOptions> backup)
 {
     private const string RemoteName = "ACOPY";
 
@@ -93,8 +93,9 @@ public class DestinationService(Secrets secrets, TelegramClient telegram, Settin
                             // Written under a temp name and renamed, so the folder only ever holds complete copies
                             var tmp = Path.Combine(sh.LocalDir, BackupFiles.TempName(name));
                             await using (var part = new SubStream(file, offset, len))
-                            await using (var copy = File.Create(tmp))
-                                await part.CopyToAsync(copy, ct);
+                            await using (var copy = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                            await using (var synced = new SyncingStream(copy, tmp, (long)Math.Max(0, backup.Value.SyncEveryMb) * 1024 * 1024))
+                                await part.CopyToAsync(synced, ct);
                             File.Move(tmp, target.FullName, overwrite: true);
                         }
                         staged = true;

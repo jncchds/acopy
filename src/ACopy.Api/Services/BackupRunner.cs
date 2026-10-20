@@ -215,7 +215,7 @@ public class BackupRunner
             AgeProcess? age = null;
             try
             {
-                await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+                await using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, 1 << 16, useAsync: true))
                 {
                     Stream sink = file;
                     if (key?.Kind == KeyKind.Age)
@@ -233,8 +233,9 @@ public class BackupRunner
 
                     await using (var encrypted = sink == file ? new NonClosingStream(file) : sink)
                     await using (var compressed = Compress(encrypted, target.Compression))
+                    await using (var synced = new SyncingStream(compressed, tempPath, SyncEveryBytes))
                     {
-                        var counting = new CountingStream(compressed);
+                        var counting = new CountingStream(synced);
                         if (cmd.SqliteSourcePath != null) await SqliteBackupAsync(cmd.SqliteSourcePath, workDir, counting, ct);
                         else if (target.Mode == ExecutionMode.DockerExec) await ExecInContainerAsync(containerId!, cmd, counting, log, ct);
                         else await RunProcessAsync(cmd, counting, log, ct);
@@ -602,6 +603,9 @@ public class BackupRunner
         }
         return (new Credentials(user, password, string.IsNullOrWhiteSpace(t.DatabaseName) ? null : t.DatabaseName.Trim()), containerId);
     }
+
+    /// <summary>How much of a backup file may sit unwritten in memory before it is forced to disk.</summary>
+    internal long SyncEveryBytes => (long)Math.Max(0, _opt.SyncEveryMb) * 1024 * 1024;
 
     private static Stream Compress(Stream output, Compression c) => c switch
     {
