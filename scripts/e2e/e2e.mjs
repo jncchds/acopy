@@ -3,7 +3,8 @@
 //  2. discovers the labelled containers (incl. jobs), adds a network-mode SQLite target
 //  3. tests every connection and backs everything up — checks uploads
 //  4. restores: Postgres (passphrase, local file), MariaDB (age, from the S3 copy), SQLite (network)
-//  5. checks the mock Telegram received documents and notifications
+//  5. checks the mock Telegram: documents, notifications, per-job chats (file-id re-sends), retention in every
+//     chat, a partly failed upload and its retry
 // Usage: node scripts/e2e/e2e.mjs [baseUrl]   — exit code 1 on any failure
 import { execSync } from 'node:child_process'
 
@@ -60,10 +61,17 @@ const s3 = {
   params: { provider: 'Other', access_key_id: 'e2ekey', endpoint: 'http://s3:9000', force_path_style: 'true', region: 'us-east-1' },
   secrets: { secret_access_key: 'e2esecret' },
 }
+// Same S3 server, dated names: the rolling job's slots arrive as name_<timestamp>… and are kept by count there
+const s3Dated = { ...s3, name: 's3-dated', remotePath: 'acopy-e2e/dated', params: { ...s3.params, fileNames: 'timestamp' } }
+// No apiUrl: the stack sets ACOPY_Telegram__ApiUrl to the mock, as it would for a self-hosted Bot API server
+// (files then go through the shared upload folder). tg-http names the same mock differently → plain HTTP uploads.
 const tg = {
-  name: 'tg', kind: 'Telegram', enabled: true, params: { chatId: '42', apiUrl: 'http://mock-telegram:8081' }, secrets: { botToken: '123:e2e' },
+  name: 'tg', kind: 'Telegram', enabled: true, params: { chatId: '42' }, secrets: { botToken: '123:e2e' },
 }
-for (const d of [s3, tg]) {
+const tgHttp = {
+  name: 'tg-http', kind: 'Telegram', enabled: true, params: { chatId: '42', apiUrl: 'http://telegram-http:8081' }, secrets: { botToken: '123:e2e' },
+}
+for (const d of [s3, s3Dated, tg, tgHttp]) {
   const existing = dests.find(x => x.name === d.name)
   if (existing) await call('PUT', `/api/destinations/${existing.id}`, d)
   else await call('POST', '/api/destinations', d)
@@ -74,8 +82,10 @@ for (const d of await call('GET', '/api/destinations')) {
 }
 await call('PUT', '/api/settings', {
   timeZone: 'Europe/Berlin', webhookUrl: null, notifyOnSuccess: true,
-  telegramToken: '123:e2e', telegramChatId: '42', telegramApiUrl: 'http://mock-telegram:8081',
+  telegramToken: '123:e2e', telegramChatId: '42', telegramApiUrl: null,
 })
+const meta = await call('GET', '/api/meta')
+check(meta.telegramApiUrl === 'http://mock-telegram:8081', 'default Bot API URL from ACOPY_Telegram__ApiUrl', meta.telegramApiUrl)
 
 // ── 2. discovery ──
 const expected = ['acopy-e2e-postgres-1-app', 'acopy-e2e-postgres-1-all', 'acopy-e2e-mariadb-1', 'mysql-net', 'acopy-e2e-mongo-1', 'acopy-e2e-valkey-1']
@@ -89,6 +99,7 @@ for (let i = 0; i < 30; i++) {
 check(expected.every(n => byName[n]), 'label discovery incl. jobs', Object.keys(byName).join(', '))
 check(byName['acopy-e2e-postgres-1-app']?.encryptionKeyName === 'e2e-pass', 'job inherits encryption label')
 check(byName['acopy-e2e-postgres-1-app']?.destinationIds.length === 2, 'job has two destinations')
+check(byName['acopy-e2e-postgres-1-all']?.telegramChatIds === '100,200', 'job has its own Telegram chats', byName['acopy-e2e-postgres-1-all']?.telegramChatIds)
 
 if (!byName['sqlite-file']) {
   await call('POST', '/api/targets', {
@@ -151,11 +162,68 @@ for (let i = 0; i < 2; i++) await backup(byName['acopy-e2e-mariadb-1'])
 const remoteFiles = sh('s3', 'ls /data/acopy-e2e/backups/acopy-e2e-mariadb-1/').split('\n').filter(Boolean)
 check(remoteFiles.length === 2, 'S3 retention keeps 2', `${remoteFiles.length} files`)
 
-const log = await (await fetch('http://localhost:5081/log')).json()
+const tgLog = async () => (await fetch('http://localhost:5081/log')).json()
+let log = await tgLog()
 const docs = log.filter(c => c.method === 'sendDocument')
 const msgs = log.filter(c => c.method === 'sendMessage')
-check(docs.some(d => d.fileName?.includes('postgres-1-app') && d.fileName.endsWith('.enc')), 'Telegram received the encrypted document', `${docs.length} documents`)
+const appDoc = docs.find(d => d.fileName?.includes('postgres-1-app') && d.fileName.endsWith('.enc'))
+check(appDoc, 'Telegram received the encrypted document', `${docs.length} documents`)
+check(appDoc?.chatId === '42', '  … in the destination\'s chat', appDoc?.chatId)
+const uploadsDir = '/var/lib/telegram-bot-api/acopy-uploads'
+check(appDoc?.localPath === `${uploadsDir}/acopy-e2e-postgres-1-app/${appDoc?.fileName}` && appDoc.fileSize === runs['acopy-e2e-postgres-1-app'].sizeBytes,
+  '  … sent by path from the shared upload folder', `${appDoc?.localPath} ${appDoc?.fileSize}`)
+const httpDoc = docs.find(d => d.fileName?.includes('mariadb-1') && !d.localPath)
+check(httpDoc && !docs.some(d => d.localPath?.includes('mariadb')), 'other Bot API URL: plain HTTP upload', httpDoc?.fileName ?? '-')
 check(msgs.some(m => m.size > 0), 'Telegram notifications sent', `${msgs.length} messages`)
+
+// Per-job chats: one upload to the first chat, the second gets the same file by its file id
+const allJob = byName['acopy-e2e-postgres-1-all']
+const uploaded = docs.find(d => d.chatId === '100' && d.fileName?.includes('postgres-1-all'))
+const resent = docs.find(d => d.chatId === '200' && uploaded && d.fileIdSent === `file-${uploaded.messageId}`)
+check(uploaded && resent, 'job chats: uploaded to 100, re-sent to 200 by file id', `${uploaded?.fileName ?? '-'} · ${resent?.fileIdSent ?? '-'}`)
+check(/^acopy-e2e-postgres-1-all_\d{8}-\d{6}\.sql\.gz$/.test(uploaded?.fileName ?? ''), '  … rolling job sent with a dated name', uploaded?.fileName)
+check(!docs.some(d => d.chatId === '42' && d.fileName?.includes('postgres-1-all')), '  … and not to the destination\'s chat')
+
+// Retention never deletes Telegram messages; the upload folder follows the database's retention
+for (let i = 0; i < 3; i++) await backup(allJob)
+const ls = dir => sh('acopy', `ls -A /telegram-uploads/${dir} 2>/dev/null || true`).split('\n').filter(Boolean)
+const allFiles = ls('acopy-e2e-postgres-1-all')
+check(allFiles.length === 3 && allFiles.every(f => /_\d{8}-\d{6}\.sql\.gz$/.test(f)), 'upload folder: rolling job keeps 3 dated copies', allFiles.join(' '))
+const dated = sh('s3', 'ls /data/acopy-e2e/dated/acopy-e2e-postgres-1-all/').split('\n').filter(Boolean)
+check(dated.length === 2 && dated.every(f => /_\d{8}-\d{6}\.sql\.gz$/.test(f)), 'rclone "always timestamped": dated names, keep 2', dated.join(' '))
+
+const lite = byName['sqlite-file']
+const tgId = (await call('GET', '/api/destinations')).find(d => d.name === 'tg').id
+const liteInput = {
+  name: 'sqlite-file', engine: 'Sqlite', mode: 'Network', databaseName: '/sqlite/app.db',
+  schedule: '0 3 * * *', enabled: true, keep: 2, naming: 'Timestamp', compression: 'Brotli', destinationIds: [tgId],
+}
+await call('PUT', `/api/targets/${lite.id}`, { ...liteInput, telegramChatIds: '300' })
+for (let i = 0; i < 3; i++) { await sleep(1100); await backup(lite) }
+const liteFiles = ls('sqlite-file')
+check(liteFiles.length === 2, 'upload folder: retention keeps 2 timestamped copies', liteFiles.join(' '))
+check(!(await tgLog()).some(c => c.method === 'deleteMessage'), 'retention deletes no Telegram messages')
+check(ls('').concat(ls('sqlite-file')).every(f => !f.endsWith('.tmp')), 'upload folder: no temp files left')
+
+// A chat that refuses the file: the upload fails, the other chat keeps its copy, and a retry only sends to the missing chat
+await call('PUT', `/api/targets/${lite.id}`, {
+  name: 'sqlite-file', engine: 'Sqlite', mode: 'Network', databaseName: '/sqlite/app.db',
+  schedule: '0 3 * * *', enabled: true, keep: 2, naming: 'Timestamp', compression: 'Brotli',
+  destinationIds: [tgId], telegramChatIds: '300, 403',
+})
+const partial = await backup(lite)
+const pu = partial.uploads.find(u => u.destinationName === 'tg')
+check(partial.status === 'Succeeded' && pu?.status === 'Failed' && pu.error?.includes('1 of 2') && pu.error.includes('403'),
+  'partial Telegram upload is reported', `${pu?.status} ${pu?.error ?? ''}`)
+const before = (await tgLog()).filter(c => c.method === 'sendDocument' && c.chatId === '300').length
+const retried = await call('POST', `/api/uploads/${pu.id}/retry`)
+const after = (await tgLog()).filter(c => c.method === 'sendDocument' && c.chatId === '300').length
+check(retried.status === 'Failed' && after === before, 'retry skips the chat that already has the file', `${retried.status} · chat 300 documents ${before} → ${after}`)
+const badChat = await call('PUT', `/api/targets/${lite.id}`, {
+  name: 'sqlite-file', engine: 'Sqlite', mode: 'Network', databaseName: '/sqlite/app.db',
+  schedule: '0 3 * * *', enabled: true, keep: 2, naming: 'Timestamp', compression: 'Brotli', telegramChatIds: 'alice',
+}).catch(e => e)
+check(badChat instanceof Error && badChat.message.includes('400'), 'invalid job chat id is rejected')
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed')
 process.exit(failures ? 1 : 0)

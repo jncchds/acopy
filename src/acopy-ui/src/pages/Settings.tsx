@@ -15,8 +15,10 @@ export default function Settings() {
   const [pw, setPw] = useState('')
   const [tgToken, setTgToken] = useState('')
   const [tgClear, setTgClear] = useState(false)
+  const [defaultApi, setDefaultApi] = useState('https://api.telegram.org')
 
   useEffect(() => {
+    api.meta().then(m => setDefaultApi(m.telegramApiUrl)).catch(() => {})
     api.settings().then(setS)
     api.system().then(setSys)
     api.timezones().then(setZones)
@@ -96,8 +98,9 @@ export default function Settings() {
             )}
           </label>
           <label>
-            Chat id
+            Chat ids
             <input value={s.telegramChatId ?? ''} onChange={e => setS({ ...s, telegramChatId: e.target.value })} placeholder="-1001234567890 or your user id" />
+            <span className="hint">Comma-separated for several chats</span>
           </label>
           <label>
             Topic / thread id (optional)
@@ -105,7 +108,8 @@ export default function Settings() {
           </label>
           <label>
             Bot API URL (optional)
-            <input value={s.telegramApiUrl ?? ''} onChange={e => setS({ ...s, telegramApiUrl: e.target.value })} placeholder="https://api.telegram.org" />
+            <input value={s.telegramApiUrl ?? ''} onChange={e => setS({ ...s, telegramApiUrl: e.target.value })} placeholder={defaultApi} />
+            <span className="hint">Blank = {defaultApi}. Use the same server as the Telegram destinations when they share this bot.</span>
           </label>
         </div>
         <p className="hint">Same rules as the webhook: failures always, successes when the toggle above is on. To send the backup files themselves, add a Telegram <em>destination</em>.</p>

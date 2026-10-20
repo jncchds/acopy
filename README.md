@@ -17,7 +17,7 @@ Point it at a database from the web UI — or just put a label on the database c
 - **One-click restore** — from the local file or a remote copy, with an automatic safety backup first.
 - **Encryption** — a passphrase (OpenSSL-compatible) or **age** public keys; decryptable without ACopy.
 - **Off-site copies** — any **rclone** backend (S3 / MinIO / R2 / B2 / SFTP / WebDAV / SMB / FTP / Drive / …)
-  or a **Telegram** chat, each with its own retention.
+  or **Telegram** chats; storage destinations with their own retention.
 - **Retention** by count, by age, or both. **Sync-friendly naming:** timestamped files
   (`app_20261019-030000.sql.gz`) *or* rolling slots (`app.0.sql.gz` → `app.1…` → back to `0`).
 - **Safe writes:** dumps go to a temp file named `.syncthing.acopy-….tmp` (Syncthing never syncs those) and
@@ -102,6 +102,7 @@ Docker access is optional. Without it, only *network* mode works and labels are 
 | `acopy.compression` | `gzip` | `gzip`, `brotli`, `none` |
 | `acopy.encryption` | — | Name of an encryption key |
 | `acopy.destinations` | — | Comma-separated destination names |
+| `acopy.telegram_chats` | — | Comma-separated Telegram chat ids for this job's files, instead of the Telegram destination's chat |
 | `acopy.database` | all | Database name (empty = all where supported); SQLite: file path. **Comma-separated = one target per database** |
 | `acopy.user` | from env | Database user |
 | `acopy.password_env` | — | Read the password from this env var of the container |
@@ -180,15 +181,91 @@ Under **Destinations**, add places to copy each backup to after it is written lo
 
 - **Storage via rclone** — forms for S3-compatible (AWS, MinIO, Cloudflare R2, Wasabi, …), Backblaze B2,
   SFTP, WebDAV / Nextcloud, SMB, FTP and a local/mounted path; *Other* takes any rclone backend with raw
-  options. Files land in `<remote path>/<database folder>/` under the same names as locally.
-- **Telegram** — a bot posts each file to a chat (or forum topic) with its size and SHA-256. The public
-  Bot API accepts up to 50 MB per file, so bigger backups are split into numbered parts
-  (`cat file.* > file` to join); with a [self-hosted Bot API server](https://github.com/tdlib/telegram-bot-api)
-  the limit is 2 GB. Old uploads are deleted from the chat by retention where Telegram allows it.
+  options. Files land in `<remote path>/<database folder>/` under the same names as locally — or, with
+  *File names: always timestamped*, with the date of the backup also for rolling databases
+  (`app.0.sql.gz` → `app_20261020-030000.sql.gz`), kept by count / age on the remote.
+- **Telegram** — a bot posts each file to one or more chats (or a forum topic) with its size and SHA-256,
+  always named with the date of the backup (rolling databases too). The public Bot API accepts up to 50 MB
+  per file, so bigger backups are split into numbered parts (`cat file.* > file` to join); with a
+  [self-hosted Bot API server](#self-hosted-telegram-bot-api-server) the limit is 2 GB. **ACopy never deletes
+  sent messages** — retention does not apply to Telegram.
 
-Each destination either mirrors the database's own retention or has its own (e.g. 7 copies locally,
+Each rclone destination either mirrors the database's own retention or has its own (e.g. 7 copies locally,
 30 days off-site). Failed uploads are shown on the run and can be retried; they also trigger a
 notification.
+
+### Telegram chats per database
+
+The destination's *Chat ids* field takes a comma-separated list, and every chat gets every file. To send a
+database's backups to the people responsible for it, set **Telegram chats** on that database (or the
+`acopy.telegram_chats` label, also per job) — it replaces the destination's chats for that database:
+
+```yaml
+labels:
+  acopy.enable: "true"
+  acopy.destinations: "tg"
+  acopy.jobs.shop.database: "shop"
+  acopy.jobs.shop.telegram_chats: "123456789, 987654321"   # two people get the shop dumps
+  acopy.jobs.blog.database: "blog"                         # → the destination's own chat
+```
+
+Each part is uploaded once and sent to the other chats by Telegram's file id, so more recipients cost no extra
+upload. Everyone must have started a chat with the bot (or be in the group) first. If some chats refuse the
+file, the upload is marked failed with the reason, the others keep their copy, and **Retry** only sends to
+the missing chats. The forum topic of a destination applies only to its own chats.
+
+Users download files from Telegram itself, so a message stays downloadable however old it is — until
+someone deletes it in the chat.
+
+### Self-hosted Telegram Bot API server
+
+Telegram's [`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) server is the same Bot API on your
+own host, without the public server's 50 MB upload limit (2 GB instead, so far fewer parts). The repository's
+`docker-compose.yml` has it as an optional service, using the community image `aiogram/telegram-bot-api`:
+
+```yaml
+services:
+  acopy:
+    # …
+    environment:
+      ACOPY_Telegram__ApiUrl: http://telegram-bot-api:8081   # default for every Telegram URL left blank
+      ACOPY_Telegram__UploadDir: /telegram-uploads           # the shared upload folder, as ACopy sees it…
+      ACOPY_Telegram__ServerUploadDir: /var/lib/telegram-bot-api/acopy-uploads   # …and as the server does
+    volumes:
+      - ./telegram-bot-api/acopy-uploads:/telegram-uploads   # only this subfolder, not the bot's session
+
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:10.2
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}       # from https://my.telegram.org → API development tools
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}   # (or TELEGRAM_API_ID_FILE / TELEGRAM_API_HASH_FILE)
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - ./telegram-bot-api:/var/lib/telegram-bot-api
+    restart: unless-stopped
+```
+
+1. Create an app at <https://my.telegram.org> (*API development tools*) for `api_id` / `api_hash`. They belong
+   to your Telegram account — keep them in `.env` or Docker secrets, not in the compose file.
+2. Start the server and point ACopy at it: either `ACOPY_Telegram__ApiUrl` (destinations and notifications
+   with a blank URL use it) or the *Bot API URL* field of a destination / the notification settings.
+3. Move the bot once: open the Telegram destination and press **Log out from public API**. The bot then
+   works only through your server; it cannot log back in to `api.telegram.org` for 10 minutes. Use the same
+   server for every place that uses this bot (destinations and notifications) — or a separate bot.
+
+**Shared upload folder.** With `ACOPY_Telegram__UploadDir` and `ACOPY_Telegram__ServerUploadDir` set, files
+for that server are not uploaded over HTTP: ACopy writes each part to
+`acopy-uploads/<database folder>/<dated file name>` (temp name first, then an atomic rename) and the server
+reads it from there by path. `/backups` is never shared with the server — only this subfolder of its data
+folder is mounted into ACopy. There is one copy per database, whatever the number of chats or destinations,
+and it follows the **database's own retention** (by count / age, parts of one backup counted as one copy;
+only names that database produces are deleted). Leftover temp files are removed on start-up. The folder
+needs room for the database's retained copies; the server must be able to read them (ACopy writes them
+world-readable, the server runs as uid 101). Destinations pointing at any other Bot API URL upload over HTTP.
+
+Don't publish the server's port: it speaks plain HTTP with the bot token in the URL, and only ACopy needs it.
+Its data folder holds the bot's session (`td.binlog`, keep it) and is named after the bot token, so keep that
+folder private.
 
 ## Syncthing and friends
 
@@ -202,7 +279,7 @@ Set `PUID`/`PGID` so the files are owned by the user your sync tool runs as.
 ## Notifications
 
 In **Settings**: a webhook URL (JSON with `text` and `content`, so Slack / Discord / Mattermost webhooks
-work as-is) and/or a **Telegram** bot + chat. Failures — of a backup, a restore or an upload — are always
+work as-is) and/or a **Telegram** bot + chats (comma-separated). Failures — of a backup, a restore or an upload — are always
 sent; successes when you enable them.
 
 ## Configuration
@@ -224,6 +301,8 @@ Everything in `appsettings.json` can be overridden with `ACOPY_`-prefixed enviro
 | `ACOPY_Docker__ScanSeconds` | `60` | Label re-scan interval |
 | `ACOPY_Backup__MaxParallel` | `2` | Jobs running at the same time |
 | `ACOPY_Backup__HistoryPerTarget` | `200` | Run-history rows kept per database (rows of files still on disk are kept) |
+| `ACOPY_Telegram__ApiUrl` | `https://api.telegram.org` | Bot API server for Telegram destinations and notifications that leave the URL blank (e.g. `http://telegram-bot-api:8081`) |
+| `ACOPY_Telegram__UploadDir` / `ACOPY_Telegram__ServerUploadDir` | — | Shared upload folder as ACopy / the self-hosted server see it — files go by path instead of HTTP (both needed) |
 | `TZ` | `UTC` | Default time zone (also editable in Settings) |
 | `PUID` / `PGID` | — (root) | Run as this user/group; backup files are owned by it |
 | `UMASK` | `022` | File-creation mask |

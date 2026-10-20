@@ -135,6 +135,11 @@ public class BackupTarget
     /// <summary>Custom engine: shell command that receives the (decrypted, decompressed) backup on stdin.</summary>
     public string? RestoreCommand { get; set; }
     public List<TargetDestination> Destinations { get; set; } = [];
+    /// <summary>
+    /// Comma-separated Telegram chat ids this job's files go to, in place of each Telegram destination's own chat
+    /// (e.g. the people responsible for this database). Null = the destinations' chats.
+    /// </summary>
+    public string? TelegramChatIds { get; set; }
 
     /// <summary>Next rolling slot to write.</summary>
     public int NextSlot { get; set; }
@@ -236,7 +241,7 @@ public class RunUpload
     public int DestinationId { get; set; }
     public Destination? Destination { get; set; }
     public UploadStatus Status { get; set; }
-    /// <summary>rclone: remote file path. Telegram: comma-separated message ids.</summary>
+    /// <summary>rclone: remote file path. Telegram: <c>chat:id,id;chat:id</c> (see <c>TelegramRef</c>).</summary>
     public string? RemoteRef { get; set; }
     public string? Error { get; set; }
     public DateTimeOffset? FinishedAt { get; set; }

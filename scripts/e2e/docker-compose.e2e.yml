@@ -12,12 +12,18 @@ services:
     environment:
       ACOPY_Auth__Password: e2e-password
       ACOPY_Docker__ScanSeconds: "10"
+      # Default Bot API server for every Telegram URL left blank (the way a self-hosted server is wired in)
+      ACOPY_Telegram__ApiUrl: http://mock-telegram:8081
+      # … and files go to it through a shared upload folder, seen under a different path on each side
+      ACOPY_Telegram__UploadDir: /telegram-uploads
+      ACOPY_Telegram__ServerUploadDir: /var/lib/telegram-bot-api/acopy-uploads
       TZ: Europe/Berlin
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - acopy-data:/data
       - acopy-backups:/backups
       - sqlite-data:/sqlite
+      - tg-uploads:/telegram-uploads
 
   postgres:
     image: postgres:17-alpine
@@ -31,6 +37,9 @@ services:
       acopy.jobs.all.schedule: "*/2 * * * *"
       acopy.jobs.all.keep: "3"
       acopy.jobs.all.naming: "rolling"
+      # The cluster dump goes to two people instead of the destination's chat
+      acopy.jobs.all.destinations: "tg,s3-dated"
+      acopy.jobs.all.telegram_chats: "100, 200"
 
   mariadb:
     image: mariadb:11
@@ -41,7 +50,7 @@ services:
       acopy.keep: "0"
       acopy.max_age_days: "30"
       acopy.encryption: "e2e-age"
-      acopy.destinations: "s3"
+      acopy.destinations: "s3,tg-http"
 
   mysql:
     image: mysql:8.4
@@ -81,9 +90,16 @@ services:
     image: node:22-alpine
     command: node /mock/mock-telegram.mjs
     ports: ["5081:8081"]
-    volumes: ["./mock-telegram.mjs:/mock/mock-telegram.mjs:ro"]
+    volumes:
+      - ./mock-telegram.mjs:/mock/mock-telegram.mjs:ro
+      - tg-uploads:/var/lib/telegram-bot-api/acopy-uploads:ro
+    networks:
+      default:
+        # A second name for the same mock: destinations using it are not "the" self-hosted server → HTTP uploads
+        aliases: [telegram-http]
 
 volumes:
+  tg-uploads:
   acopy-data:
   acopy-backups:
   sqlite-data:

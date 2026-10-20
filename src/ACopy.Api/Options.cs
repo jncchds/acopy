@@ -32,6 +32,25 @@ public class AuthOptions
     public string? Password { get; set; }
 }
 
+public class TelegramOptions
+{
+    /// <summary>
+    /// Bot API server used when a destination or the notification settings leave the URL blank — e.g. a
+    /// self-hosted <c>http://telegram-bot-api:8081</c>. Empty = the public https://api.telegram.org.
+    /// </summary>
+    public string? ApiUrl { get; set; }
+
+    /// <summary>
+    /// Self-hosted server only: a folder shared with the Bot API server (inside its data folder), as ACopy sees it.
+    /// Each file is copied there part by part, sent by path and deleted again — instead of an HTTP upload.
+    /// Applies to destinations that use <see cref="ApiUrl"/>. Needs <see cref="ServerUploadDir"/> too.
+    /// </summary>
+    public string? UploadDir { get; set; }
+
+    /// <summary>The same folder as the Bot API server sees it, e.g. <c>/var/lib/telegram-bot-api/acopy-uploads</c>.</summary>
+    public string? ServerUploadDir { get; set; }
+}
+
 public class BackupOptions
 {
     public int MaxParallel { get; set; } = 2;
