@@ -26,6 +26,25 @@ public static class DumpCommandBuilder
         return t.Mode == ExecutionMode.Network ? BuildNetwork(t, c, extra, tempDir) : BuildExec(t, c, extra);
     }
 
+    /// <summary>
+    /// MariaDB/MySQL error 1577: the server was started with <c>event_scheduler=DISABLED</c> and refuses
+    /// <c>SHOW EVENTS</c>, so a dump with <c>--events</c> fails.
+    /// </summary>
+    public static bool IsEventSchedulerDisabled(string error) =>
+        error.Contains("event scheduler is disabled", StringComparison.OrdinalIgnoreCase) || error.Contains("(1577)", StringComparison.Ordinal);
+
+    /// <summary>The same MariaDB/MySQL dump without <c>--events</c>; null when it has no such option.</summary>
+    public static DumpCommand? WithoutEvents(DumpCommand cmd) => cmd.Argv.Contains("--events")
+        ? new DumpCommand
+        {
+            Argv = cmd.Argv.Where(a => a != "--events").ToList(),
+            Env = cmd.Env,
+            OutputFile = cmd.OutputFile,
+            TempFiles = cmd.TempFiles,
+            SqliteSourcePath = cmd.SqliteSourcePath,
+        }
+        : null;
+
     private static DumpCommand BuildNetwork(BackupTarget t, Credentials c, List<string> extra, string tempDir)
     {
         var host = t.Host ?? "";

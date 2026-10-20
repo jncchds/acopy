@@ -131,6 +131,7 @@ for (const t of Object.values(byName)) {
   if (r.status !== 'Succeeded') console.log(r.log)
   for (const u of r.uploads) check(u.status === 'Succeeded', `  upload ${t.name} → ${u.destinationName}`, u.error ?? u.remoteRef ?? '')
 }
+check(runs['acopy-e2e-mariadb-1']?.log?.includes('event scheduler is disabled'), 'mariadb: disabled event scheduler → dumped without --events')
 check(runs['acopy-e2e-postgres-1-app']?.filePath?.endsWith('.sql.gz.enc'), 'passphrase-encrypted file name')
 check(runs['acopy-e2e-mariadb-1']?.filePath?.endsWith('.sql.gz.age'), 'age-encrypted file name')
 
