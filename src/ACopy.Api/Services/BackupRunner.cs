@@ -680,10 +680,15 @@ public class BackupRunner
         }
     }
 
+    /// <summary>The <c>NICE</c> setting (default 10, 0 = off), applied to dumps run inside database containers.</summary>
+    private static readonly int DumpNice =
+        int.TryParse(Environment.GetEnvironmentVariable("NICE"), out var n) ? Math.Max(0, n) : 10;
+
     private async Task ExecInContainerAsync(string containerId, DumpCommand cmd, Stream output, StringBuilder log, CancellationToken ct)
     {
         var stderr = new StringBuilder();
-        var code = await _docker.ExecAsync(containerId, cmd.Argv, cmd.Env, output, stderr, ct);
+        var argv = DumpCommandBuilder.LowPriority(cmd.Argv, DumpNice);
+        var code = await _docker.ExecAsync(containerId, argv, cmd.Env, output, stderr, ct);
         log.Append(stderr);
         if (code != 0) throw new InvalidOperationException($"{(cmd.Argv[0] == "sh" ? "dump" : cmd.Argv[0])} exited with code {code}: {LastLine(stderr)}");
     }

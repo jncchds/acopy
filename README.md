@@ -139,7 +139,7 @@ target in the UI survives re-syncs.
 |---|---|---|---|---|
 | PostgreSQL | `pg_dump` / `pg_dumpall` (v18 — dumps any older server) | server's own | `.sql` (`--clean --if-exists`) | `psql` ✓ |
 | MySQL / MariaDB | `mariadb-dump --single-transaction` | `mariadb-dump` or `mysqldump` | `.sql` | `mariadb` / `mysql` ✓ |
-| MongoDB | `mongodump --archive` | same | `.archive` | `mongorestore --drop` ✓ |
+| MongoDB | `mongodump --archive --numParallelCollections=1` | same | `.archive` | `mongorestore --drop` ✓ |
 | Redis / Valkey | `redis-cli --rdb` | same | `.rdb` | manual (copy as `dump.rdb`) |
 | SQLite | online backup API on a file mounted into ACopy | `sqlite3 .backup` (or a plain copy) | `.sqlite` | backup API / `sqlite3 .restore` ✓ |
 | SQL Server | — | `BACKUP DATABASE … WITH COPY_ONLY` via `sqlcmd` | `.bak` | `RESTORE … WITH REPLACE` ✓ |
@@ -307,7 +307,7 @@ Everything in `appsettings.json` can be overridden with `ACOPY_`-prefixed enviro
 | `TZ` | `UTC` | Default time zone (also editable in Settings) |
 | `PUID` / `PGID` | — (root) | Run as this user/group; backup files are owned by it |
 | `UMASK` | `022` | File-creation mask |
-| `NICE` | `10` | CPU priority of ACopy and the dumps it runs (disk priority is lowered too); `0` = normal priority |
+| `NICE` | `10` | CPU priority of ACopy and the dumps it runs — in Docker-exec mode inside the database container too, when it has `nice`/`ionice` (disk priority is lowered as well); `0` = normal priority |
 
 Webhook, Telegram, "notify on success" and the time zone are set in the UI (Settings).
 

@@ -6,8 +6,9 @@ set -e
 
 # Backups are background work: run ACopy and every dump/compress/upload it starts at low CPU and disk
 # priority so a large backup never starves the databases and services it shares the host with.
-# NICE=0 turns this off. (Dumps in exec mode run inside the database container and are not affected.)
-NICE="${NICE:-10}"
+# NICE=0 turns this off. Dumps in exec mode run inside the database container; ACopy starts them there
+# under nice/ionice with the same setting (when the container has those tools).
+export NICE="${NICE:-10}"
 if [ "$NICE" != "0" ]; then
   renice -n "$NICE" -p $$ >/dev/null 2>&1 || true
   ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true

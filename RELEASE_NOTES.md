@@ -1,5 +1,14 @@
 # Release notes
 
+## v0.2.3 — 2026-10-25
+
+### Fixes
+- **MongoDB backups no longer exhaust memory on small hosts.** `mongodump` now reads one collection at a time
+  (`--numParallelCollections=1`) instead of four, which kept `mongod`'s cache growing until the host froze.
+  Pass `--numParallelCollections` (or `-j`) in the extra arguments to choose your own.
+- **Docker-exec dumps run at low priority too.** Dumps that run inside the database container now start under
+  `nice`/`ionice` with the `NICE` setting (when the container has those tools), like ACopy's own work already did.
+
 ## v0.2.2 — 2026-10-20
 
 ### Fixes

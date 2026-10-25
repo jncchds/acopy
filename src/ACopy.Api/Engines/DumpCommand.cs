@@ -45,6 +45,30 @@ public static class DumpCommandBuilder
         }
         : null;
 
+    /// <summary>
+    /// Docker-exec mode: the dump runs inside the database container, outside ACopy's own low priority
+    /// (entrypoint <c>NICE</c>), so run it under <c>nice</c>/<c>ionice</c> there — each only if the container
+    /// has it and it works. <paramref name="nice"/> 0 leaves the command unchanged.
+    /// </summary>
+    public static IReadOnlyList<string> LowPriority(IReadOnlyList<string> argv, int nice)
+    {
+        if (nice <= 0) return argv;
+        const string script = """
+            n=$1; shift
+            if nice -n "$n" true >/dev/null 2>&1; then set -- nice -n "$n" "$@"; fi
+            if ionice -c 2 -n 7 true >/dev/null 2>&1; then set -- ionice -c 2 -n 7 "$@"; fi
+            exec "$@"
+            """;
+        return ["sh", "-c", script, "sh", Math.Min(nice, 19).ToString(), .. argv];
+    }
+
+    /// <summary>
+    /// mongodump reads 4 collections at once by default, which pulls that much more through mongod's cache;
+    /// on small hosts that can exhaust memory. One at a time unless the arguments say otherwise.
+    /// </summary>
+    private static IEnumerable<string> MongoParallelism(List<string> extra) =>
+        extra.Any(a => a.StartsWith("--numParallelCollections") || a.StartsWith("-j")) ? [] : ["--numParallelCollections=1"];
+
     private static DumpCommand BuildNetwork(BackupTarget t, Credentials c, List<string> extra, string tempDir)
     {
         var host = t.Host ?? "";
@@ -97,6 +121,7 @@ public static class DumpCommandBuilder
                     argv.AddRange(["--config", cfg]);
                 }
                 if (!string.IsNullOrEmpty(db)) argv.AddRange(["--db", db]);
+                argv.AddRange(MongoParallelism(extra));
                 argv.AddRange(extra);
                 return new() { Argv = argv, TempFiles = temp };
             }
@@ -163,6 +188,7 @@ public static class DumpCommandBuilder
                     if (!extra.Any(a => a.StartsWith("--authenticationDatabase"))) args.AddRange(["--authenticationDatabase", "admin"]);
                 }
                 if (!string.IsNullOrEmpty(db)) args.AddRange(["--db", db]);
+                args.AddRange(MongoParallelism(extra));
                 args.AddRange(extra);
                 const string script = """
                     if [ -n "$ACOPY_PASSWORD" ]; then exec mongodump "$@" --password "$ACOPY_PASSWORD"; fi
