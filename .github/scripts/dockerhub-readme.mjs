@@ -33,6 +33,9 @@ function convertLine(line) {
       // ![alt](target "title") and [text](target "title")
       .replace(/(!?)\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(\s+"[^"]*")?\s*\)/g, (_, bang, text, target, title = '') =>
         `${bang}[${text}](${resolve(target, bang === '!')}${title})`)
+      // the outer link of a badge, [![alt](image)](target), whose text holds brackets
+      .replace(/(\)\]\(\s*)<?([^)\s>]+)>?(\s+"[^"]*")?(\s*\))/g, (_, head, target, title = '', tail) =>
+        `${head}${resolve(target, false)}${title}${tail}`)
       // [label]: target (reference definitions)
       .replace(/^(\s{0,3}\[[^\]]+\]:\s*)(\S+)/, (_, head, target) => head + resolve(target, false))
       // <img src="…">, <a href="…">
