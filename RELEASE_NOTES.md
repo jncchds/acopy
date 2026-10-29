@@ -1,5 +1,25 @@
 # Release notes
 
+## v0.3.0 — 2026-10-29
+
+### Network mode, filled in from a container
+- **Pick a container for a network-mode target** and ACopy fills in the host, port, user and database. It
+  compares its own container's Docker networks with the database's and says how it would get there — a
+  shared network (by name), the default bridge (by IP, which can change), a published host port, or not at
+  all — then checks with a live TCP connect. When it can't get there, it shows the compose snippet (and the
+  `docker network connect` command) that puts ACopy on the database's network.
+- **Network-mode targets read credentials from the linked container**, like exec mode: a blank user or
+  password, or *Password from container variable*, comes from the container's env at run time, so the
+  password is never typed in or sent to the browser. Labelled `acopy.mode=network` targets get this too.
+- The Docker page's **＋ Back up** opens the form with that container picked.
+
+### Fixes
+- **MongoDB backups no longer exhaust memory on small hosts.** `mongodump` now reads one collection at a time
+  (`--numParallelCollections=1`) instead of four, which kept `mongod`'s cache growing until the host froze.
+  Pass `--numParallelCollections` (or `-j`) in the extra arguments to choose your own.
+- **Docker-exec dumps run at low priority too.** Dumps that run inside the database container now start under
+  `nice`/`ionice` with the `NICE` setting (when the container has those tools), like ACopy's own work already did.
+
 ## v0.2.2 — 2026-10-20
 
 ### Fixes

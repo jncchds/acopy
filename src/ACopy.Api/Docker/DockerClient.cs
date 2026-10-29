@@ -13,7 +13,20 @@ public record ContainerSummary(
 
 public record ContainerDetails(
     string Id, string Name, string Image, bool Running,
-    IReadOnlyDictionary<string, string> Env, IReadOnlyDictionary<string, string> Labels);
+    IReadOnlyDictionary<string, string> Env, IReadOnlyDictionary<string, string> Labels)
+{
+    /// <summary>HostConfig.NetworkMode: "bridge", "host", "container:…", "none" or a network name.</summary>
+    public string NetworkMode { get; init; } = "";
+    public IReadOnlyList<ContainerNetwork> Networks { get; init; } = [];
+    /// <summary>TCP ports the image declares (EXPOSE), e.g. 5432.</summary>
+    public IReadOnlyList<int> ExposedPorts { get; init; } = [];
+    /// <summary>TCP ports published on the host.</summary>
+    public IReadOnlyList<PublishedPort> PublishedPorts { get; init; } = [];
+}
+
+public record ContainerNetwork(string Name, string? IpAddress, string? Gateway, IReadOnlyList<string> Aliases);
+
+public record PublishedPort(int ContainerPort, string? HostIp, int HostPort);
 
 /// <summary>
 /// Minimal Docker Engine API client over the unix socket — just what ACopy needs
@@ -127,7 +140,65 @@ public class DockerClient
         }
         return new ContainerDetails(
             c.Id, (c.Name ?? "").TrimStart('/'), c.Config?.Image ?? "",
-            c.State?.Running == true, env, c.Config?.Labels ?? new Dictionary<string, string>());
+            c.State?.Running == true, env, c.Config?.Labels ?? new Dictionary<string, string>())
+        {
+            NetworkMode = c.HostConfig?.NetworkMode ?? "",
+            Networks = (c.NetworkSettings?.Networks ?? []).Select(n => new ContainerNetwork(
+                n.Key, Blank(n.Value.IPAddress), Blank(n.Value.Gateway),
+                [.. (n.Value.Aliases ?? []).Concat(n.Value.DNSNames ?? []).Distinct()])).ToList(),
+            ExposedPorts = (c.Config?.ExposedPorts?.Keys ?? Enumerable.Empty<string>()).Select(TcpPort).OfType<int>().Order().ToList(),
+            PublishedPorts = (c.NetworkSettings?.Ports ?? [])
+                .SelectMany(p => (p.Value ?? []).Select(b => (port: TcpPort(p.Key), b)))
+                .Where(x => x.port != null && int.TryParse(x.b.HostPort, out _))
+                .Select(x => new PublishedPort(x.port!.Value, Blank(x.b.HostIp), int.Parse(x.b.HostPort!)))
+                .ToList(),
+        };
+    }
+
+    private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+    /// <summary>"5432/tcp" → 5432; other protocols → null.</summary>
+    private static int? TcpPort(string key)
+    {
+        var parts = key.Split('/');
+        return (parts.Length == 1 || parts[1] == "tcp") && int.TryParse(parts[0], out var p) ? p : null;
+    }
+
+    private ContainerDetails? _self;
+    private DateTimeOffset _selfCheckedAt;
+
+    /// <summary>
+    /// ACopy's own container, when it runs in one on this Docker host — found by its hostname (the short container
+    /// id unless overridden) or the container id in its mount table. Null when it cannot be found.
+    /// </summary>
+    public async Task<ContainerDetails?> SelfAsync(CancellationToken ct)
+    {
+        if (_self != null) return await InspectAsync(_self.Id, ct) ?? (_self = null);
+        if (DateTimeOffset.UtcNow - _selfCheckedAt < TimeSpan.FromMinutes(1)) return null;
+        _selfCheckedAt = DateTimeOffset.UtcNow;
+
+        // The id in the mount table (resolv.conf, hostname, hosts come from /var/lib/docker/containers/<id>/) is exact;
+        // the hostname is the short id unless the compose file sets one.
+        var candidates = new List<string>();
+        try
+        {
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
+                         File.ReadAllText("/proc/self/mountinfo"), "/containers/([0-9a-f]{64})/"))
+                candidates.Add(m.Groups[1].Value);
+        }
+        catch { /* not Linux */ }
+        if (Environment.GetEnvironmentVariable("HOSTNAME") is { Length: > 0 } h) candidates.Add(h);
+        try { candidates.Add(File.ReadAllText("/etc/hostname").Trim()); } catch { /* not Linux */ }
+
+        foreach (var id in candidates.Where(c => c.Length > 0).Distinct())
+        {
+            try
+            {
+                if (await InspectAsync(id, ct) is { } c) return _self = c;
+            }
+            catch (HttpRequestException) { /* try the next candidate */ }
+        }
+        return null;
     }
 
     /// <summary>
@@ -249,6 +320,8 @@ public class DockerClient
         public string? Name { get; set; }
         public InspectConfig? Config { get; set; }
         public InspectState? State { get; set; }
+        public InspectHostConfig? HostConfig { get; set; }
+        public InspectNetworkSettings? NetworkSettings { get; set; }
     }
 
     private class InspectConfig
@@ -256,6 +329,32 @@ public class DockerClient
         public string? Image { get; set; }
         public string[]? Env { get; set; }
         public Dictionary<string, string>? Labels { get; set; }
+        public Dictionary<string, JsonElement>? ExposedPorts { get; set; }
+    }
+
+    private class InspectHostConfig
+    {
+        public string? NetworkMode { get; set; }
+    }
+
+    private class InspectNetworkSettings
+    {
+        public Dictionary<string, InspectEndpoint>? Networks { get; set; }
+        public Dictionary<string, List<InspectBinding>?>? Ports { get; set; }
+    }
+
+    private class InspectEndpoint
+    {
+        public string? IPAddress { get; set; }
+        public string? Gateway { get; set; }
+        public string[]? Aliases { get; set; }
+        public string[]? DNSNames { get; set; }
+    }
+
+    private class InspectBinding
+    {
+        public string? HostIp { get; set; }
+        public string? HostPort { get; set; }
     }
 
     private class InspectState

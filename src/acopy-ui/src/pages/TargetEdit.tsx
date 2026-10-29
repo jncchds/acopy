@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   api, ApiError, apiError, describeCron, ENGINE_ICON,
-  type Compression, type Container, type Destination, type EncKey, type Engine, type EngineInfo, type Meta, type Mode, type Naming, type Target, type TargetInput, type TestResult,
+  type Compression, type Container, type Destination, type EncKey, type Engine, type EngineInfo, type Meta, type Mode, type Naming, type NetworkReach, type Target, type TargetInput, type TestResult,
 } from '../api'
 import ToggleField from '../components/ToggleField'
 import { useTargets } from '../hooks/useTargets'
@@ -32,6 +32,38 @@ function fromTarget(t: Target): TargetInput {
   }
 }
 
+const REACH_STYLE: Record<NetworkReach['level'], [string, string]> = {
+  Good: ['ok', '✅'],
+  Fragile: ['warn', '⚠️'],
+  Unreachable: ['danger', '⛔'],
+  Unknown: ['', 'ℹ️'],
+}
+
+/** What the networks say about reaching the picked container, plus the live TCP check. */
+function ReachCallout({ reach, host, port }: { reach: NetworkReach; host: string | null; port: number | null }) {
+  const [cls, icon] = REACH_STYLE[reach.level]
+  const edited = (host ?? '') !== (reach.host ?? '') || (port ?? null) !== (reach.port ?? null)
+  return (
+    <div className={`callout span-2 ${cls}`} style={{ marginBottom: '0.9rem' }}>
+      <div>
+        {icon} {reach.message}{' '}
+        {reach.reachable === true && <span className="pill pill-succeeded">TCP {reach.host}:{reach.port} open</span>}
+        {reach.reachable === false && <span className="pill pill-failed">TCP {reach.host}:{reach.port} — {reach.probeError}</span>}
+      </div>
+      {edited && <div className="hint">The host or port below was changed from this suggestion — 🔌 Test connection checks the values you entered.</div>}
+      {reach.fix && (
+        <>
+          <div className="hint" style={{ marginTop: '0.4rem' }}>
+            To reach it by name, attach {reach.acopyContainer ? <code>{reach.acopyContainer}</code> : 'ACopy'} to the database’s network
+            (or run <code>docker network connect {reach.networks.find(n => n !== 'bridge') ?? '<network>'} {reach.acopyContainer ?? 'acopy'}</code>):
+          </div>
+          <div className="code-block" style={{ marginTop: '0.3rem' }}>{reach.fix}</div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function slug(s: string) {
   return s.trim().toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '') || 'backup'
 }
@@ -53,6 +85,7 @@ export default function TargetEdit() {
   const [containers, setContainers] = useState<Container[] | null>(null)
   const [dockerError, setDockerError] = useState('')
   const [hint, setHint] = useState('')
+  const [reach, setReach] = useState<NetworkReach | null>(null)
   const [deleteFiles, setDeleteFiles] = useState(false)
   const [keys, setKeys] = useState<EncKey[]>([])
   const [dests, setDests] = useState<Destination[]>([])
@@ -68,6 +101,13 @@ export default function TargetEdit() {
   useEffect(() => {
     if (!loaded && existing) { setF(fromTarget(existing)); setLoaded(true) }
   }, [existing, loaded])
+  // "＋ Back up" on the Docker page opens the form with that container picked.
+  const [params] = useSearchParams()
+  const [prefilled, setPrefilled] = useState(false)
+  useEffect(() => {
+    const c = params.get('container')
+    if (isNew && meta && c && !prefilled) { setPrefilled(true); pickContainer(c) }
+  }, [isNew, meta, params, prefilled]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const info: EngineInfo | undefined = meta?.engines.find(e => e.engine === f.engine)
   const readOnly = existing?.source === 'DockerLabel'
@@ -82,16 +122,29 @@ export default function TargetEdit() {
     }))
   }
 
-  const pickContainer = async (name: string) => {
+  /**
+   * Picking a container fills what it can. In exec mode that is the engine; in network mode also the host and port
+   * ACopy can reach it on, the user and the database — the password stays on the server, read from the container's
+   * env at run time (the target remembers the container by name).
+   */
+  const pickContainer = async (name: string, mode: Mode = f.mode) => {
     set('containerName', name)
-    setHint('')
+    setHint(''); setReach(null)
     if (!name) return
     try {
       const d = await api.detect(name)
+      const n = d.network
+      const network = mode === 'Network'
       setF(prev => ({
         ...prev,
         engine: d.engine ?? prev.engine,
         name: prev.name || name,
+        ...(network && {
+          host: n.host ?? prev.host,
+          port: n.port != null && n.port !== meta?.engines.find(e => e.engine === (d.engine ?? prev.engine))?.defaultPort ? n.port : null,
+          username: prev.username || d.user || '',
+          databaseName: prev.databaseName || d.database || '',
+        }),
       }))
       const bits = [
         d.engine && `engine ${d.engine}`,
@@ -99,9 +152,19 @@ export default function TargetEdit() {
         d.hasPassword && 'a password',
         d.database && `database “${d.database}”`,
       ].filter(Boolean)
-      if (bits.length) setHint(`Detected ${bits.join(', ')} from the container — blank user/password fields use these at run time.`)
+      if (bits.length) setHint(`Detected ${bits.join(', ')} from the container — ${network
+        ? 'a blank password is read from its env at run time (never sent to the browser).'
+        : 'blank user/password fields use these at run time.'}`)
       if (!d.running) setHint(h => (h ? h + ' ' : '') + 'The container is not running.')
+      if (network) setReach(n)
     } catch { /* detection is a convenience */ }
+  }
+
+  const pickMode = (m: Mode) => {
+    set('mode', m)
+    setReach(null)
+    // Coming from exec mode with a container picked: fill the network fields from it.
+    if (m === 'Network' && f.containerName && !f.host) pickContainer(f.containerName, m)
   }
 
   const payload = (): TargetInput => ({
@@ -156,7 +219,12 @@ export default function TargetEdit() {
     const p = meta?.labelPrefix ?? 'acopy'
     const l: string[] = [`${p}.enable: "true"`]
     l.push(`${p}.engine: "${f.engine.toLowerCase()}"`)
-    if (f.mode === 'Network') l.push(`${p}.mode: "network"`)
+    if (f.mode === 'Network') {
+      l.push(`${p}.mode: "network"`)
+      // Labels default the host to the container itself and the port to the engine's.
+      if (f.host && f.host !== f.containerName) l.push(`${p}.host: "${f.host}"`)
+      if (f.port && f.port !== info?.defaultPort) l.push(`${p}.port: "${f.port}"`)
+    }
     if (f.name) l.push(`${p}.name: "${f.name}"`)
     l.push(`${p}.schedule: "${f.schedule}"`)
     l.push(`${p}.keep: "${f.keep}"`)
@@ -181,6 +249,8 @@ export default function TargetEdit() {
 
   const err = (k: string) => errors[k]?.map(m => <span key={m} className="field-error">{m}</span>)
   const tgSelected = dests.filter(d => d.kind === 'Telegram' && f.destinationIds?.includes(d.id))
+  /** Credentials can come from a container's env: always in exec mode, in network mode when a container is linked. */
+  const fromEnv = f.mode === 'DockerExec' || !!f.containerName
 
   return (
     <div className="page page-narrow" style={{ maxWidth: 820 }}>
@@ -214,7 +284,7 @@ export default function TargetEdit() {
             Where the dump runs
             <div className="segmented">
               {(['DockerExec', 'Network'] as Mode[]).map(m => (
-                <button key={m} type="button" className={f.mode === m ? 'active' : ''} onClick={() => set('mode', m)}
+                <button key={m} type="button" className={f.mode === m ? 'active' : ''} onClick={() => pickMode(m)}
                         disabled={m === 'Network' ? !info?.supportsNetwork : !info?.supportsExec}>
                   {m === 'DockerExec' ? '🐳 Inside the container (docker exec)' : '🌐 From ACopy over the network'}
                 </button>
@@ -228,12 +298,12 @@ export default function TargetEdit() {
           </label>
 
           <div className="form-grid">
-            {f.mode === 'DockerExec' ? (
+            {(f.mode === 'DockerExec' || (f.engine !== 'Sqlite' && f.engine !== 'Custom' && (containers || f.containerName))) && (
               <label className="span-2">
-                Container
+                {f.mode === 'DockerExec' ? 'Container' : 'Fill from a container (optional)'}
                 {containers ? (
                   <select value={f.containerName ?? ''} onChange={e => pickContainer(e.target.value)}>
-                    <option value="">— pick a container —</option>
+                    <option value="">{f.mode === 'DockerExec' ? '— pick a container —' : '— none, enter the host below —'}</option>
                     {f.containerName && !containers.some(c => c.name === f.containerName) && <option value={f.containerName}>{f.containerName} (not found)</option>}
                     {containers.map(c => (
                       <option key={c.id} value={c.name}>
@@ -245,10 +315,15 @@ export default function TargetEdit() {
                   <input value={f.containerName ?? ''} onChange={e => set('containerName', e.target.value)} placeholder="container name" />
                 )}
                 {dockerError && <span className="hint">Container list unavailable: {dockerError} — type the name.</span>}
+                {f.mode === 'Network' && !hint && (
+                  <span className="hint">Fills the host, port, user and database, and checks ACopy can reach it. A blank password is read from the container’s env at run time.</span>
+                )}
                 {hint && <span className="hint">{hint}</span>}
                 {err('containerName')}
               </label>
-            ) : f.engine !== 'Sqlite' && (
+            )}
+            {f.mode === 'Network' && reach && <ReachCallout reach={reach} host={f.host ?? null}port={f.port ?? info?.defaultPort ?? null} />}
+            {f.mode === 'Network' && f.engine !== 'Sqlite' && (
               <>
                 <label>Host<input value={f.host ?? ''} onChange={e => set('host', e.target.value)} placeholder="db, 192.168.1.10, my-postgres" />{err('host')}</label>
                 <label>Port<input type="number" value={f.port ?? ''} onChange={e => set('port', e.target.value ? Number(e.target.value) : null)} placeholder={String(info?.defaultPort ?? '')} />{err('port')}</label>
@@ -268,12 +343,12 @@ export default function TargetEdit() {
                 <label>
                   User
                   <input value={f.username ?? ''} onChange={e => set('username', e.target.value)}
-                         placeholder={f.mode === 'DockerExec' ? 'from container env' : info?.defaultUser ?? ''} autoComplete="off" />
+                         placeholder={fromEnv ? 'from container env' : info?.defaultUser ?? ''} autoComplete="off" />
                 </label>
                 <label>
                   Password
                   <input type="password" value={f.password ?? ''} onChange={e => set('password', e.target.value)} autoComplete="new-password"
-                         placeholder={existing?.hasPassword && !f.clearPassword ? '•••••• (unchanged)' : f.mode === 'DockerExec' ? 'from container env' : ''} />
+                         placeholder={existing?.hasPassword && !f.clearPassword ? '•••••• (unchanged)' : fromEnv ? 'from container env' : ''} />
                   {existing?.hasPassword && !readOnly && (
                     <span className="hint">
                       <a style={{ cursor: 'pointer' }} onClick={() => set('clearPassword', !f.clearPassword)}>
@@ -283,7 +358,7 @@ export default function TargetEdit() {
                   )}
                   <span className="hint">Encrypted at rest; never sent back to the browser.</span>
                 </label>
-                {f.mode === 'DockerExec' && (
+                {fromEnv && (
                   <label className="span-2">
                     Password from container variable
                     <input value={f.passwordEnv ?? ''} onChange={e => set('passwordEnv', e.target.value)} placeholder="e.g. POSTGRES_PASSWORD — optional, overrides the field above" />

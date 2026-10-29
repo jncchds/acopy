@@ -88,7 +88,7 @@ export default function Docker() {
                       <td>
                         {t ? <a style={{ cursor: 'pointer' }} onClick={() => nav(`/targets/${t.id}`)}>{c.labelled ? '🏷 ' : ''}{t.name} →</a>
                           : c.detectedEngine && c.state === 'running'
-                            ? <button className="btn-add btn-sm" onClick={() => nav('/targets/new')}>＋ Back up</button>
+                            ? <button className="btn-add btn-sm" onClick={() => nav(`/targets/new?container=${encodeURIComponent(c.name)}`)}>＋ Back up</button>
                             : <span className="muted">—</span>}
                       </td>
                     </tr>

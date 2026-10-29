@@ -592,7 +592,10 @@ public class BackupRunner
     //  Shared
     // ════════════════════════════════════════════════════════════════
 
-    /// <summary>Credentials: explicit values win; DockerExec fills blanks from the container's environment.</summary>
+    /// <summary>
+    /// Credentials: explicit values win; blanks come from the container's environment — the exec container, or in
+    /// network mode the linked container when one is set.
+    /// </summary>
     public async Task<(Credentials, string?)> ResolveAsync(BackupTarget t, StringBuilder log, CancellationToken ct)
     {
         var user = t.Username;
@@ -606,7 +609,22 @@ public class BackupRunner
             var c = await _docker.InspectAsync(t.ContainerName, ct) ?? throw new InvalidOperationException($"Container '{t.ContainerName}' not found");
             if (!c.Running) throw new InvalidOperationException($"Container '{t.ContainerName}' is not running");
             containerId = c.Id;
+            FromContainerEnv(c);
+        }
+        else if (!string.IsNullOrWhiteSpace(t.ContainerName) && _docker.Configured && (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(password) || !string.IsNullOrWhiteSpace(t.PasswordEnv)))
+        {
+            // Network mode with a linked container: its env fills in the credentials, the connection still goes over the network.
+            try
+            {
+                if (await _docker.InspectAsync(t.ContainerName, ct) is { } c) FromContainerEnv(c);
+                else log.AppendLine($"warning: container '{t.ContainerName}' not found — credentials not read from its env");
+            }
+            catch (HttpRequestException e) { log.AppendLine($"warning: could not inspect '{t.ContainerName}': {e.Message}"); }
+        }
+        return (new Credentials(user, password, string.IsNullOrWhiteSpace(t.DatabaseName) ? null : t.DatabaseName.Trim()), containerId);
 
+        void FromContainerEnv(ContainerDetails c)
+        {
             if (!string.IsNullOrWhiteSpace(t.PasswordEnv))
             {
                 if (c.Env.TryGetValue(t.PasswordEnv, out var p)) password = p;
@@ -616,7 +634,6 @@ public class BackupRunner
             if (string.IsNullOrEmpty(user) && detected.User != null) { user = detected.User; log.AppendLine($"user from container env: {user}"); }
             if (string.IsNullOrEmpty(password) && detected.Password != null) { password = detected.Password; log.AppendLine("password from container env"); }
         }
-        return (new Credentials(user, password, string.IsNullOrWhiteSpace(t.DatabaseName) ? null : t.DatabaseName.Trim()), containerId);
     }
 
     /// <summary>How much of a backup file may sit unwritten in memory before it is forced to disk.</summary>
@@ -680,10 +697,15 @@ public class BackupRunner
         }
     }
 
+    /// <summary>The <c>NICE</c> setting (default 10, 0 = off), applied to dumps run inside database containers.</summary>
+    private static readonly int DumpNice =
+        int.TryParse(Environment.GetEnvironmentVariable("NICE"), out var n) ? Math.Max(0, n) : 10;
+
     private async Task ExecInContainerAsync(string containerId, DumpCommand cmd, Stream output, StringBuilder log, CancellationToken ct)
     {
         var stderr = new StringBuilder();
-        var code = await _docker.ExecAsync(containerId, cmd.Argv, cmd.Env, output, stderr, ct);
+        var argv = DumpCommandBuilder.LowPriority(cmd.Argv, DumpNice);
+        var code = await _docker.ExecAsync(containerId, argv, cmd.Env, output, stderr, ct);
         log.Append(stderr);
         if (code != 0) throw new InvalidOperationException($"{(cmd.Argv[0] == "sh" ? "dump" : cmd.Argv[0])} exited with code {code}: {LastLine(stderr)}");
     }

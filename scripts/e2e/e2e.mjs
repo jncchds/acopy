@@ -109,6 +109,23 @@ if (!byName['sqlite-file']) {
   byName = await targetsByName()
 }
 
+// Network-mode prefill from a container: host/port/user from Docker, the password stays server-side
+const pgDetect = await call('GET', '/api/docker/containers/acopy-e2e-postgres-1/detect')
+const pn = pgDetect.network
+check(pn.level === 'Good' && pn.host === 'acopy-e2e-postgres-1' && pn.port === 5432 && pn.acopyContainer === 'acopy-e2e-acopy-1',
+  'network prefill: shared network → container name', `${pn.level} ${pn.host}:${pn.port} via ${pn.acopyContainer}`)
+check(pgDetect.user === 'postgres' && pgDetect.hasPassword && pgDetect.password === undefined, 'network prefill: credentials detected, password not returned')
+const island = (await call('GET', '/api/docker/containers/acopy-e2e-island-1/detect')).network
+check(island.level === 'Unreachable' && island.fix?.includes('island'), 'network prefill: no shared network → unreachable + fix', `${island.level} ${island.message}`)
+if (!byName['pg-net']) {
+  // No password: it comes from the linked container's POSTGRES_PASSWORD at run time
+  await call('POST', '/api/targets', {
+    name: 'pg-net', engine: 'PostgreSql', mode: 'Network', host: pn.host, port: null, containerName: 'acopy-e2e-postgres-1',
+    username: pgDetect.user, databaseName: 'appdb', schedule: '0 3 * * *', enabled: true, keep: 2, naming: 'Timestamp', compression: 'Gzip',
+  })
+  byName = await targetsByName()
+}
+
 // ── 3. connection tests (also readiness probes) and backups ──
 for (const t of Object.values(byName)) {
   for (let i = 0; i < 25; i++) {

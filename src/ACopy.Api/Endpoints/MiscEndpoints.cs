@@ -154,6 +154,7 @@ public static class MiscEndpoints
             {
                 engine = engine?.ToString(), user = creds?.User, hasPassword = creds?.Password != null, database = creds?.Database,
                 c.Running,
+                network = await NetworkSuggestionAsync(docker, c, engine, ct),
             });
         });
 
@@ -249,6 +250,43 @@ public static class MiscEndpoints
     }
 
     private static string? Blank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
+    /// <summary>Network-mode host/port for a container, how ACopy would reach it, and whether a TCP connect works now.</summary>
+    private static async Task<object> NetworkSuggestionAsync(DockerClient docker, ContainerDetails c, Engine? engine, CancellationToken ct)
+    {
+        var self = await docker.SelfAsync(ct);
+        var s = NetworkReach.Suggest(c, self, engine == null ? null : EngineCatalog.Get(engine.Value).DefaultPort);
+        string? probeError = null;
+        bool? reachable = null;
+        if (s.Host != null && s.Port != null && c.Running)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(3));
+            try
+            {
+                using var tcp = new System.Net.Sockets.TcpClient();
+                await tcp.ConnectAsync(s.Host, s.Port.Value, cts.Token);
+                reachable = true;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reachable = false; probeError = "timed out after 3 s"; }
+            catch (System.Net.Sockets.SocketException e)
+            {
+                reachable = false;
+                probeError = e.SocketErrorCode switch
+                {
+                    System.Net.Sockets.SocketError.HostNotFound or System.Net.Sockets.SocketError.TryAgain or System.Net.Sockets.SocketError.NoData
+                        => $"'{s.Host}' does not resolve from ACopy",
+                    System.Net.Sockets.SocketError.ConnectionRefused => "connection refused",
+                    _ => e.Message,
+                };
+            }
+        }
+        return new
+        {
+            s.Host, s.Port, level = s.Level.ToString(), s.Message, s.Fix, reachable, probeError,
+            acopyContainer = self?.Name, networks = c.Networks.Select(n => n.Name),
+        };
+    }
 
     private static Task SignInAsync(HttpContext ctx) => ctx.SignInAsync(
         CookieAuthenticationDefaults.AuthenticationScheme,
