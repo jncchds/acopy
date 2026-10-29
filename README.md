@@ -11,7 +11,9 @@ Point it at a database from the web UI — or just put a label on the database c
     No ports to expose, tool versions always match the server, credentials are read from the container's
     environment (`POSTGRES_PASSWORD`, `MYSQL_ROOT_PASSWORD`, `MONGO_INITDB_ROOT_PASSWORD`, …).
   - **Network** — connects over TCP with the client tools bundled in the image
-    (pg_dump 18, mariadb-dump, mongodump, redis-cli, sqlite3).
+    (pg_dump 18, mariadb-dump, mongodump, redis-cli, sqlite3). Pick a container and ACopy fills in the host,
+    port, user and database, tells you whether it can reach it (shared Docker network, published port, or
+    not at all — with the compose snippet to fix it), and reads a blank password from the container's env.
 - **Configure by Docker labels** — `acopy.enable=true` on a container and it shows up automatically;
   several databases or jobs per container.
 - **One-click restore** — from the local file or a remote copy, with an automatic safety backup first.
@@ -105,8 +107,8 @@ Docker access is optional. Without it, only *network* mode works and labels are 
 | `acopy.telegram_chats` | — | Comma-separated Telegram chat ids for this job's files, instead of the Telegram destination's chat |
 | `acopy.database` | all | Database name (empty = all where supported); SQLite: file path. **Comma-separated = one target per database** |
 | `acopy.user` | from env | Database user |
-| `acopy.password_env` | — | Read the password from this env var of the container |
-| `acopy.password` | from env | Literal password (prefer `password_env`) |
+| `acopy.password_env` | — | Read the password from this env var of the container (both modes) |
+| `acopy.password` | from env | Literal password (prefer `password_env`); in either mode a blank one comes from the container's env |
 | `acopy.host` / `acopy.port` | container name / default | Network mode only |
 | `acopy.args` | — | Extra dump-tool arguments; for `custom` the shell command |
 | `acopy.restore_command` | — | `custom`: shell command that receives the backup on stdin |

@@ -241,6 +241,22 @@ export interface Detected {
   hasPassword: boolean
   database: string | null
   running: boolean
+  network: NetworkReach
+}
+
+/** How ACopy's container can reach a database container over the network (from the two containers' Docker networks). */
+export interface NetworkReach {
+  host: string | null
+  port: number | null
+  /** Good = shared user-defined network; Fragile = an IP or published host port; Unknown = ACopy not in a container here. */
+  level: 'Good' | 'Fragile' | 'Unreachable' | 'Unknown'
+  message: string
+  fix: string | null
+  /** TCP connect to host:port just now (null when not tried). */
+  reachable: boolean | null
+  probeError: string | null
+  acopyContainer: string | null
+  networks: string[]
 }
 
 export interface TestResult { ok: boolean; message: string; details: string | null }

@@ -100,6 +100,14 @@ services:
         # A second name for the same mock: destinations using it are not "the" self-hosted server → HTTP uploads
         aliases: [telegram-http]
 
+  # Not labelled, on a network ACopy is not on, no published port: the network-mode picker must say "unreachable"
+  island:
+    image: valkey/valkey:8-alpine
+    networks: [island]
+
+networks:
+  island:
+
 volumes:
   tg-uploads:
   acopy-data:
